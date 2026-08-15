@@ -1,0 +1,6 @@
+# dsh.bundle.patch mount layer — REQUIRED, do not delete.
+# `dsh plugin add` registers this package into dsh.profile.bundles and the
+# boot merges this file: the insert row mounts the plugin's host half.
+- insert:
+    - id: vscode-sidebar
+      name: dsh-plugin-vscode-sidebar
