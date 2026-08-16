@@ -1,19 +1,22 @@
 /**
- * The source-control panel, VSCode-git-style: a repo picker (the repository
- * containing the cwd plus nested checkouts discovered under it; the pick
- * persists in the tab meta across pane restructures), staged / unstaged
- * change groups with colored status badges and per-file +/- line counts, an
- * INLINE diff preview per file row, a commit box, branch switch with
- * ahead/behind counts, and a history list drawn as a lane GRAPH (SVG
- * columns, joins and merge-parent slants — see git-graph.ts) instead of a
- * plain text table. Clicking a changed file or a history row opens a
+ * The source-control panel, VSCode-git-style: EVERY discovered repository
+ * (the cwd's own + nested checkouts, bounded by the scan-depth setting)
+ * renders as its own collapsible section — collapsed by default and fully
+ * LAZY (no status/git commands run until the user expands one). Inside a
+ * section: staged / unstaged change groups with colored status badges and
+ * per-file +/- line counts, an INLINE diff preview per file row, a commit
+ * box, branch switch with ahead/behind counts, and a history list drawn as
+ * a lane GRAPH (SVG columns, joins and merge-parent slants — see
+ * git-graph.ts). The history graph is REMOTE-AWARE like VSCode: commits
+ * only reachable from a remote ref render purple, commits on the local
+ * branch (or its main spine) render blue, and a synced branch stays an
+ * all-blue axis. Clicking a changed file or a history row opens a
  * dedicated diff TAB (see {@link DiffTab}); the chevron on a file row
  * toggles the inline diff instead. Right-click menus carry the advanced
  * operations (open in editor, discard, revert, cherry-pick, copy
- * paths/hashes). Refresh is manual + on mount/focus (no file watcher —
- * KISS).
+ * paths/hashes). Refresh is manual + on mount (no file watcher — KISS).
  */
-import { useCallback, useEffect, useRef, useState, type MouseEvent, type ReactNode } from 'react'
+import { memo, useCallback, useEffect, useRef, useState, type MouseEvent, type ReactNode } from 'react'
 import clsx from 'clsx'
 import {
   Button, IconBranchOutline16, IconChevronDownOutline14, IconChevronRightOutline14, IconCodeOutline16,
@@ -28,6 +31,10 @@ import type { SidebarTab } from './state.ts'
 import { DiffView } from './DiffView.tsx'
 import { emptyGraphState, extendGraph, GRAPH_PALETTE, type GraphRow, type GraphState } from './git-graph.ts'
 import css from './sidebar.module.css'
+
+/** Remote-aware history colors (VSCode-like): remote-only purple, local blue. */
+const GRAPH_REMOTE_COLOR = '#a371f7'
+const GRAPH_LOCAL_COLOR = '#4f8cff'
 
 /** The XY status letters a row badge shows (X = index, Y = worktree). */
 const badgeOf = (entry: GitStatusEntry): string => gitStatusLetter(entry.xy)
@@ -62,8 +69,8 @@ function baseName(path: string): string {
   return at === -1 ? path : path.slice(at + 1)
 }
 
-/** The display label of one discovered repo in the picker: its path relative
- *  to the session cwd (nested checkouts) or its basename (cwd itself / an
+/** The display label of one discovered repo: its path relative to the
+ *  session cwd (nested checkouts) or its basename (cwd itself / an
  *  enclosing parent repo). */
 function repoLabel(root: string, cwd: string | undefined): string {
   const name = baseName(root)
@@ -84,6 +91,11 @@ function refNames(refs: string): string[] {
       .map(ref => (ref.includes(' -> ') ? ref.slice(ref.indexOf(' -> ') + 4) : ref))
       .map(ref => (ref.startsWith('tag: ') ? ref.slice(5) : ref)),
   )]
+}
+
+/** Whether one ref name is a REMOTE-tracking ref (origin/* etc.). */
+function isRemoteRef(ref: string, remotePrefix: string): boolean {
+  return ref.startsWith(remotePrefix) || (ref.includes('/') && ref.startsWith('origin/'))
 }
 
 /** The pending destructive action (discard / revert / cherry-pick), gated by a confirm modal. */
@@ -123,8 +135,11 @@ function graphCx(col: number): number {
  * The per-row lane glyph: verticals for live lanes, slanted connectors for
  * joins/merge parents, and the commit node — colored per lane like the
  * VSCode git-graph. Columns beyond {@link GRAPH_MAX_LANES} are clipped.
+ * `nodeColor` (when present) overrides the node, its column vertical and
+ * its outgoing slants — the remote-aware coloring: purple for remote-only
+ * commits, blue for the local branch / main spine.
  */
-function HistoryGraph({ row }: { row: GraphRow }): ReactNode {
+function HistoryGraph({ row, nodeColor }: { row: GraphRow; nodeColor?: string }): ReactNode {
   const laneCount = Math.min(row.lanes.length, GRAPH_MAX_LANES)
   const width = laneCount * GRAPH_COL_WIDTH + 4
   const nodeCol = Math.min(row.col, laneCount - 1)
@@ -141,7 +156,7 @@ function HistoryGraph({ row }: { row: GraphRow }): ReactNode {
             y1={0}
             x2={graphCx(col)}
             y2={GRAPH_ROW_HEIGHT}
-            stroke={colorOf(row.colors[col] ?? 0)}
+            stroke={nodeColor !== undefined && col === nodeCol ? nodeColor : colorOf(row.colors[col] ?? 0)}
             strokeWidth={1.4}
             opacity={0.8}
           />
@@ -152,7 +167,7 @@ function HistoryGraph({ row }: { row: GraphRow }): ReactNode {
           key={`s${index}`}
           d={`M ${graphCx(slant.from)} ${GRAPH_ROW_HEIGHT / 2} C ${graphCx(slant.from)} ${GRAPH_ROW_HEIGHT * 0.78}, ${graphCx(slant.to)} ${GRAPH_ROW_HEIGHT * 0.62}, ${graphCx(slant.to)} ${GRAPH_ROW_HEIGHT}`}
           fill="none"
-          stroke={colorOf(row.colors[slant.to] ?? 0)}
+          stroke={nodeColor !== undefined && slant.from === nodeCol ? nodeColor : colorOf(row.colors[slant.to] ?? 0)}
           strokeWidth={1.4}
           opacity={0.8}
         />
@@ -161,23 +176,76 @@ function HistoryGraph({ row }: { row: GraphRow }): ReactNode {
         cx={graphCx(nodeCol)}
         cy={GRAPH_ROW_HEIGHT / 2}
         r={GRAPH_NODE_R}
-        fill={colorOf(row.colors[nodeCol] ?? 0)}
+        fill={nodeColor ?? colorOf(row.colors[nodeCol] ?? 0)}
       />
     </svg>
   )
 }
 
-export function GitView(props: {
-  scope: SessionScope
-  onOpenFile: (path: string) => void
-  /** Open a diff tab (the shell places it below the git pane on first use). */
-  onOpenDiff: (tab: SidebarTab) => void
-  /** The repo selection persisted in the tab's meta (survives remounts). */
-  savedRepo?: string | null
-  /** Persist a repo-selection change back into the tab's meta. */
-  onRepoChange?: (repo: string | null) => void
+// ── One repository's panel (lazy: mounts only while expanded) ──────────────
+
+/** One history row, memoized on its DATA (entry/graph/color/remote prefix):
+ *  a refresh that returns identical rows never re-renders the history list.
+ *  The callbacks close over constants (repo root, stable setters), so an
+ *  older render's closures stay correct across skipped re-renders. */
+const HistoryRow = memo(function HistoryRow(props: {
+  entry: GitLogEntry
+  graphRow: GraphRow | undefined
+  nodeColor: string | undefined
+  remotePrefix: string
+  onOpen: (entry: GitLogEntry) => void
+  onMenu: (event: MouseEvent, entry: GitLogEntry) => void
 }) {
-  const { scope, onOpenFile, onOpenDiff, savedRepo, onRepoChange } = props
+  const { entry, graphRow, nodeColor, remotePrefix, onOpen, onMenu } = props
+  const refs = refNames(entry.refs)
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      className={css.gitLogRow}
+      title={`${entry.author} · ${entry.date}\n${entry.hashFull}`}
+      onClick={() => { onOpen(entry) }}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault()
+          onOpen(entry)
+        }
+      }}
+      onContextMenu={(event) => { onMenu(event, entry) }}
+    >
+      {graphRow !== undefined && <HistoryGraph row={graphRow} nodeColor={nodeColor} />}
+      <span className={css.gitLogBody}>
+        <span className={css.gitLogLine1}>
+          <span className={css.gitLogHash}>{entry.hash}</span>
+          <span className={css.gitLogSubject}>{entry.subject}</span>
+        </span>
+        <span className={css.gitLogLine2}>
+          {refs.map(ref => (
+            <span
+              key={ref}
+              className={clsx(css.gitLogRef, isRemoteRef(ref, remotePrefix) && css.gitLogRefRemote)}
+            >
+              {ref}
+            </span>
+          ))}
+          <span className={css.gitLogMeta}>{entry.author} · {relativeTime(entry.date)}</span>
+        </span>
+      </span>
+    </div>
+  )
+}, (prev, next) =>
+  prev.entry === next.entry
+  && prev.graphRow === next.graphRow
+  && prev.nodeColor === next.nodeColor
+  && prev.remotePrefix === next.remotePrefix)
+
+function RepoPanel(props: {
+  scope: SessionScope
+  root: string
+  onOpenFile: (path: string) => void
+  onOpenDiff: (tab: SidebarTab) => void
+}) {
+  const { scope, root, onOpenFile, onOpenDiff } = props
   const [status, setStatus] = useState<GitStatusResult | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -189,14 +257,6 @@ export function GitView(props: {
   /** Whether the history was fully paged (a batch shorter than LOG_BATCH). */
   const [logEnded, setLogEnded] = useState(false)
   const [logLoadingMore, setLogLoadingMore] = useState(false)
-  /**
-   * The explicitly selected repository root (from the picker). Null means
-   * AUTO — the repository containing the session cwd (status.root). Seeded
-   * from the tab meta so a pane split (diff tabs restructure the tree and
-   * remount this view) keeps the selection.
-   */
-  const [repo, setRepo] = useState<string | null>(() => savedRepo ?? null)
-  /** The open inline diff (its key + fetched content), or null. */
   const [inline, setInline] = useState<InlineDiff | null>(null)
   const [inlineLoading, setInlineLoading] = useState(false)
   /** The history lane graph: per-row drawing models + the cross-page state. */
@@ -210,34 +270,32 @@ export function GitView(props: {
   /** The pending destructive action awaiting confirmation. */
   const [confirm, setConfirm] = useState<ConfirmState | null>(null)
 
-  const effectiveRepo = repo ?? status?.root
-
   const refresh = useCallback(async (): Promise<void> => {
     setLoading(true)
     setError(null)
     try {
       const [statusResult, branchResult, logResult] = await Promise.all([
-        api.gitStatus(scope, repo ?? undefined),
-        api.gitBranch(scope, repo ?? undefined).catch(() => ({ current: '', names: [] as string[] })),
+        api.gitStatus(scope, root),
+        api.gitBranch(scope, root).catch(() => ({ current: '', names: [] as string[] })),
         // The first history page only; the rest arrives via "load more".
-        api.gitLog(scope, LOG_BATCH, 0, repo ?? undefined).catch(() => [] as GitLogEntry[]),
+        api.gitLog(scope, LOG_BATCH, 0, root).catch(() => [] as GitLogEntry[]),
       ])
       setStatus(statusResult)
       setBranchNames(branchResult.names)
       setLogEntries(logResult)
       setLogEnded(logResult.length < LOG_BATCH)
-      // Rebuild the lane graph from a fresh state (repo/branch may differ).
+      // Rebuild the lane graph from a fresh state (branch may differ).
       const extended = extendGraph(emptyGraphState(), logResult)
       graphStateRef.current = extended.state
       setGraphRows(extended.rows)
-      // A stale inline diff (repo switch / refresh) is dropped with its rows.
+      // A stale inline diff (refresh) is dropped with its rows.
       setInline(null)
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason))
     } finally {
       setLoading(false)
     }
-  }, [scope.sessionId, scope.cwd, repo])
+  }, [scope.sessionId, scope.cwd, root])
 
   useEffect(() => { void refresh() }, [refresh])
 
@@ -246,7 +304,7 @@ export function GitView(props: {
     if (logLoadingMore || logEnded) return
     setLogLoadingMore(true)
     try {
-      const next = await api.gitLog(scope, LOG_BATCH, logEntries.length, repo ?? undefined)
+      const next = await api.gitLog(scope, LOG_BATCH, logEntries.length, root)
       setLogEntries(entries => [...entries, ...next])
       // Continue the lane graph across the page boundary: the previous
       // page's tips seed the next one, keeping columns and colors stable.
@@ -272,7 +330,7 @@ export function GitView(props: {
         path: entry.path,
         staged,
         untracked: isUntracked(entry),
-        repo: effectiveRepo,
+        repo: root,
       },
     })
   }
@@ -283,30 +341,27 @@ export function GitView(props: {
       id: `diff:c:${entry.hashFull}`,
       type: 'diff',
       title: `${entry.hash} ${entry.subject}`,
-      diff: { kind: 'commit', hash: entry.hash, hashFull: entry.hashFull, subject: entry.subject, repo: effectiveRepo },
+      diff: { kind: 'commit', hash: entry.hash, hashFull: entry.hashFull, subject: entry.subject, repo: root },
     })
   }
 
   /** Toggle the inline diff of one file row: fetch the unified diff (or the
    *  untracked file content) once, then render it inline under the row. */
   const toggleInline = async (entry: GitStatusEntry, staged: boolean): Promise<void> => {
-    const key = `${staged ? 's' : 'u'}:${entry.path}:${effectiveRepo ?? ''}`
+    const key = `${staged ? 's' : 'u'}:${entry.path}`
     if (inline?.key === key) {
       setInline(null)
       return
     }
-    // Loading a DIFFERENT row: drop the previous diff so it never flashes
-    // under the row being expanded.
     setInline(null)
     setInlineLoading(true)
     setCommitError(null)
     try {
-      const repoRoot = effectiveRepo
-      let result = await api.gitDiff(scope, entry.path, staged, repoRoot)
+      let result = await api.gitDiff(scope, entry.path, staged, root)
       if (result.diff === '') {
         // The requested side is empty — try the OTHER side once (the change
         // may have moved across staging since the list refreshed).
-        const other = await api.gitDiff(scope, entry.path, !staged, repoRoot)
+        const other = await api.gitDiff(scope, entry.path, !staged, root)
         if (other.diff !== '') result = other
       }
       if (result.diff !== '') {
@@ -315,7 +370,7 @@ export function GitView(props: {
       }
       // Empty diff: an untracked file renders as a full-file addition.
       if (isUntracked(entry) && !staged) {
-        const text = await api.fsRead(scope, entry.absPath ?? entry.path, repoRoot)
+        const text = await api.fsRead(scope, entry.absPath ?? entry.path, root)
         setInline({
           key,
           diff: '',
@@ -335,8 +390,8 @@ export function GitView(props: {
   const stageEntry = async (entry: GitStatusEntry, staged: boolean): Promise<void> => {
     setBusy(true)
     try {
-      if (staged) await api.gitUnstage(scope, entry.path, effectiveRepo)
-      else await api.gitStage(scope, entry.path, effectiveRepo)
+      if (staged) await api.gitUnstage(scope, entry.path, root)
+      else await api.gitStage(scope, entry.path, root)
       await refresh()
     } finally {
       setBusy(false)
@@ -346,8 +401,8 @@ export function GitView(props: {
   const stageAll = async (staged: boolean): Promise<void> => {
     setBusy(true)
     try {
-      if (staged) await api.gitUnstage(scope, undefined, effectiveRepo)
-      else await api.gitStage(scope, undefined, effectiveRepo)
+      if (staged) await api.gitUnstage(scope, undefined, root)
+      else await api.gitStage(scope, undefined, root)
       await refresh()
     } finally {
       setBusy(false)
@@ -360,7 +415,7 @@ export function GitView(props: {
     setBusy(true)
     setCommitError(null)
     try {
-      await api.gitCommit(scope, message, effectiveRepo)
+      await api.gitCommit(scope, message, root)
       setCommitMsg('')
       await refresh()
     } catch (reason) {
@@ -375,7 +430,7 @@ export function GitView(props: {
     setBusy(true)
     setCommitError(null)
     try {
-      await api.gitCheckout(scope, branch, effectiveRepo)
+      await api.gitCheckout(scope, branch, root)
       await refresh()
     } catch (reason) {
       setCommitError(`${t('checkoutError')}: ${reason instanceof Error ? reason.message : String(reason)}`)
@@ -419,8 +474,24 @@ export function GitView(props: {
 
   const stagedEntries = (status?.entries ?? []).filter(isStagedEntry)
   const unstagedEntries = (status?.entries ?? []).filter(isUnstagedEntry)
-  const repos: GitRepoInfo[] = status?.repos ?? []
   const aheadBehind = status?.aheadBehind ?? null
+
+  // ── Remote-aware history coloring (VSCode-style) ─────────────────────────
+  const localBranch = status?.branch ?? ''
+  const upstream = aheadBehind?.upstream ?? ''
+  const remotePrefix = upstream.includes('/') ? `${upstream.slice(0, upstream.indexOf('/'))}/` : 'origin/'
+  /** The node color of one history row: remote-only → purple, local/spine → blue. */
+  const nodeColorOf = (entry: GitLogEntry, graphRow: GraphRow | undefined): string | undefined => {
+    const refs = refNames(entry.refs)
+    const remote = refs.some(ref => isRemoteRef(ref, remotePrefix))
+    const local = refs.some(ref => ref === localBranch || ref === 'HEAD')
+    if (remote && !local) return GRAPH_REMOTE_COLOR
+    if (local) return GRAPH_LOCAL_COLOR
+    // Unlabelled commits on the MAIN spine (lane 0) belong to the local
+    // branch's ancestry — keep the all-blue axis VSCode shows in sync.
+    if (graphRow !== undefined && graphRow.col === 0) return GRAPH_LOCAL_COLOR
+    return undefined
+  }
 
   /** The +a / −d line counts of one row (absent for untracked/binary). */
   const rowCounts = (entry: GitStatusEntry): ReactNode => {
@@ -439,8 +510,7 @@ export function GitView(props: {
 
   const renderEntry = (entry: GitStatusEntry, staged: boolean): ReactNode => {
     const key = `${staged ? 's' : 'u'}:${entry.path}`
-    const inlineKey = `${key}:${effectiveRepo ?? ''}`
-    const expanded = inline?.key === inlineKey
+    const expanded = inline?.key === key
     return (
       <div key={key}>
         <div className={css.gitRow}>
@@ -499,30 +569,8 @@ export function GitView(props: {
   }
 
   return (
-    <div className={css.git}>
+    <div className={css.gitRepoPanel}>
       <div className={css.gitHeader}>
-        {(repos.length > 1 || savedRepo !== null) && (
-          <select
-            className={css.gitRepoSelect}
-            value={effectiveRepo ?? ''}
-            title={t('gitSelectRepo')}
-            onChange={(event) => {
-              const next = event.target.value === '' ? null : event.target.value
-              setRepo(next)
-              onRepoChange?.(next)
-            }}
-          >
-            {effectiveRepo === undefined && <option value="">{t('gitSelectRepo')}…</option>}
-            {repos.map(repoInfo => (
-              <option key={repoInfo.root} value={repoInfo.root}>{repoLabel(repoInfo.root, scope.cwd)}</option>
-            ))}
-            {/* A persisted selection whose repo dropped out of the discovery
-                list stays reachable (and clearable) until the user changes it. */}
-            {typeof savedRepo === 'string' && savedRepo !== '' && !repos.some(repoInfo => repoInfo.root === savedRepo) && (
-              <option value={savedRepo}>{repoLabel(savedRepo, scope.cwd)}</option>
-            )}
-          </select>
-        )}
         <select
           className={css.gitBranchSelect}
           value={status?.branch ?? ''}
@@ -555,9 +603,7 @@ export function GitView(props: {
       {loading && <div className={css.gitPlaceholder}>{t('loading')}</div>}
       {!loading && error !== null && <div className={css.gitError}>{error}</div>}
       {!loading && status !== null && !status.isRepo && (
-        <div className={css.gitPlaceholder}>
-          {repos.length > 0 ? t('gitReposFound', { count: repos.length }) : t('notRepo')}
-        </div>
+        <div className={css.gitPlaceholder}>{t('notRepo')}</div>
       )}
 
       {status !== null && status.isRepo && (
@@ -614,35 +660,15 @@ export function GitView(props: {
             {logEntries.map((entry, index) => {
               const graphRow: GraphRow | undefined = graphRows[index]
               return (
-                <div
+                <HistoryRow
                   key={entry.hashFull}
-                  role="button"
-                  tabIndex={0}
-                  className={css.gitLogRow}
-                  title={`${entry.author} · ${entry.date}\n${entry.hashFull}`}
-                  onClick={() => { openCommitDiff(entry) }}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Enter' || event.key === ' ') {
-                      event.preventDefault()
-                      openCommitDiff(entry)
-                    }
-                  }}
-                  onContextMenu={(event) => { openHistoryMenu(event, entry) }}
-                >
-                  {graphRow !== undefined && <HistoryGraph row={graphRow} />}
-                  <span className={css.gitLogBody}>
-                    <span className={css.gitLogLine1}>
-                      <span className={css.gitLogHash}>{entry.hash}</span>
-                      <span className={css.gitLogSubject}>{entry.subject}</span>
-                    </span>
-                    <span className={css.gitLogLine2}>
-                      {refNames(entry.refs).map(ref => (
-                        <span key={ref} className={css.gitLogRef}>{ref}</span>
-                      ))}
-                      <span className={css.gitLogMeta}>{entry.author} · {relativeTime(entry.date)}</span>
-                    </span>
-                  </span>
-                </div>
+                  entry={entry}
+                  graphRow={graphRow}
+                  nodeColor={nodeColorOf(entry, graphRow)}
+                  remotePrefix={remotePrefix}
+                  onOpen={openCommitDiff}
+                  onMenu={openHistoryMenu}
+                />
               )
             })}
             {!logEnded && (
@@ -693,7 +719,7 @@ export function GitView(props: {
                   title: t('discardTitle'),
                   description: t('discardDesc', { path: target.entry.path }),
                   confirmLabel: t('discard'),
-                  onConfirm: () => api.gitDiscard(scope, target.entry.absPath ?? target.entry.path, effectiveRepo),
+                  onConfirm: () => api.gitDiscard(scope, target.entry.absPath ?? target.entry.path, root),
                 })
                 return
               }
@@ -747,7 +773,7 @@ export function GitView(props: {
                   title: t('revertTitle'),
                   description: t('revertDesc', { subject: target.entry.subject }),
                   confirmLabel: t('revertCommit'),
-                  onConfirm: () => api.gitRevert(scope, target.entry.hashFull, effectiveRepo),
+                  onConfirm: () => api.gitRevert(scope, target.entry.hashFull, root),
                 })
                 return
               }
@@ -756,7 +782,7 @@ export function GitView(props: {
                   title: t('cherryPickTitle'),
                   description: t('cherryPickDesc', { subject: target.entry.subject }),
                   confirmLabel: t('cherryPickCommit'),
-                  onConfirm: () => api.gitCherryPick(scope, target.entry.hashFull, effectiveRepo),
+                  onConfirm: () => api.gitCherryPick(scope, target.entry.hashFull, root),
                 })
               }
             }}
@@ -794,6 +820,95 @@ export function GitView(props: {
           </Modal>
         </>
       )}
+    </div>
+  )
+}
+
+// ── The multi-repo source-control view ─────────────────────────────────────
+
+export function GitView(props: {
+  scope: SessionScope
+  onOpenFile: (path: string) => void
+  /** Open a diff tab (the shell places it below the git pane on first use). */
+  onOpenDiff: (tab: SidebarTab) => void
+}) {
+  const { scope, onOpenFile, onOpenDiff } = props
+  const [repos, setRepos] = useState<GitRepoInfo[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  /** The expanded repo roots (default ALL collapsed: no status computed). */
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
+
+  const refresh = useCallback(async (force = false): Promise<void> => {
+    setError(null)
+    try {
+      const result = await api.gitRepos(scope, force)
+      setRepos(result.repos)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason))
+    }
+  }, [scope.sessionId, scope.cwd])
+
+  useEffect(() => { void refresh() }, [refresh])
+
+  const toggleRepo = (root: string): void => {
+    setExpanded(current => {
+      const next = new Set(current)
+      if (next.has(root)) next.delete(root)
+      else next.add(root)
+      return next
+    })
+  }
+
+  return (
+    <div className={css.git}>
+      <div className={css.gitHeader}>
+        <span className={css.gitReposTitle}>{t('git')}</span>
+        {repos !== null && <span className={css.gitReposCount}>{t('gitReposCount', { count: repos.length })}</span>}
+        <button
+          type="button"
+          className={css.iconButton}
+          aria-label={t('refresh')}
+          title={t('refresh')}
+          onClick={() => { void refresh(true) }}
+        >
+          <IconRefreshOutline16 />
+        </button>
+      </div>
+      {repos === null && error === null && <div className={css.gitPlaceholder}>{t('loading')}</div>}
+      {error !== null && <div className={css.gitError}>{error}</div>}
+      {repos !== null && repos.length === 0 && (
+        <div className={css.gitPlaceholder}>{t('notRepo')}</div>
+      )}
+      {repos?.map(repoInfo => {
+        const open = expanded.has(repoInfo.root)
+        return (
+          <div key={repoInfo.root} className={css.gitRepoSection}>
+            <button
+              type="button"
+              className={clsx(css.gitRepoHeader, open && css.gitRepoHeaderOpen)}
+              aria-expanded={open}
+              onClick={() => { toggleRepo(repoInfo.root) }}
+            >
+              {open ? <IconChevronDownOutline14 /> : <IconChevronRightOutline14 />}
+              <span className={css.gitRepoLabel} title={repoInfo.root}>{repoLabel(repoInfo.root, scope.cwd)}</span>
+              {repoInfo.branch !== undefined && repoInfo.branch !== '' && (
+                <span className={css.gitRepoBranch}>
+                  <IconBranchOutline16 size={12} />
+                  {repoInfo.branch}
+                </span>
+              )}
+            </button>
+            {open && (
+              <RepoPanel
+                scope={scope}
+                root={repoInfo.root}
+                onOpenFile={onOpenFile}
+                onOpenDiff={onOpenDiff}
+              />
+            )}
+          </div>
+        )
+      })}
     </div>
   )
 }

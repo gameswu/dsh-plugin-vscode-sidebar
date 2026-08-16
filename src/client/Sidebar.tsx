@@ -19,7 +19,7 @@
  *
  * Narrow (mobile, <768px) viewports show ONLY the right sidebar: entering
  * narrow migrates the bottom panel's tabs INTO the right tree
- * (migrateBottomTabs) — one workbench, the bottom tabs thrown into its
+ * (migrateBottomTabs) —one workbench, the bottom tabs thrown into its
  * strips. The right panel becomes a full-width drawer, the bottom panel
  * and its toggle button disappear, and the layout push is disabled (the
  * drawer floats). Widening does not migrate back: the tabs keep living in
@@ -42,20 +42,16 @@ import { Workbench, type WorkbenchActions } from './split-pane.tsx'
 import { useNarrowViewport } from './breakpoints.ts'
 import type { NewTabOption } from './TabBar.tsx'
 import type { TabDragPayload } from './TabBar.tsx'
-import { isTabDirty, saveTab } from './dirty-tabs.ts'
 import { relativeTo } from './paths.ts'
 import { FileTypeIcon, fileBaseName } from './file-icons.tsx'
 import { OrphanedTab } from './OrphanedTab.tsx'
 import { RenderBoundary } from './RenderBoundary.tsx'
 import { detectNewDirectSubagent } from './subagent-detect.ts'
 import { detectNewJob } from './subagent-jobs.ts'
+import { subscribeAgentTerminalFeed } from './agent-terminals-feed.ts'
 import { t } from './locales.ts'
 import { api, type SessionScope } from './api.ts'
 import css from './sidebar.module.css'
-
-/** How many consecutive reconnect failures stop the agent-terminals push loop
- * (mirror of the terminal view's own cap; the loop restarts on session switch). */
-const FAILURE_LIMIT = 3
 
 /** Render the content of one tab (dispatched by type). */
 function TabContent(props: {
@@ -81,7 +77,7 @@ function TabContent(props: {
     return <OrphanedTab ctx={ctx} store={store} scope={scope} tab={tab} visible={visible} />
   }
   // One boundary per tab: a render crash in a viewer/editor shows a strip in
-  // THIS tab's pane only — the toggle cluster, the other tabs, and the panel
+  // THIS tab's pane only —the toggle cluster, the other tabs, and the panel
   // stay alive (issue #31). The tab strip (close button) lives outside, so a
   // crashing tab stays closable; the root boundary in index.tsx remains the
   // last resort for errors in the sidebar shell itself. The descriptor is
@@ -102,7 +98,7 @@ function TabContent(props: {
  * Hidden tabs (editor/diff) never show; `available` returning false shows
  * a disabled row (e.g. terminal at capacity) instead of hiding the option.
  * Tabs the user disabled in the side card settings are filtered out
- * entirely — re-enabling them is the settings page's job. */
+ * entirely —re-enabling them is the settings page's job. */
 function buildNewTabOptions(state: SidebarState, ctx: Context, scope: SessionScope): NewTabOption[] {
   const service = ctx.vscodeSidebar
   if (service === undefined) return []
@@ -134,7 +130,7 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
   // panel (and its toggle button) disappears, and the layout push is
   // disabled (the drawer floats over the app shell). Entering narrow
   // MIGRATES the bottom tree's tabs into the right tree (migrateBottomTabs)
-  // — the merged display is the right sidebar alone, the bottom tabs thrown
+  // —the merged display is the right sidebar alone, the bottom tabs thrown
   // into its strips. Widening never rewrites the migrated state: the tabs
   // keep living in the right tree.
   const narrow = useNarrowViewport()
@@ -161,7 +157,7 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
   // session header's right-aligned utilities (the "Session log" download
   // capsule) must yield. layout.css keys off this body attribute to push the
   // header's right padding out past the cluster. Only the CLOSED panel needs
-  // it — an open panel already squeezes `#root` left, moving the header clear.
+  // it —an open panel already squeezes `#root` left, moving the header clear.
   const collapsed = state === undefined || !state.panelOpen
   useEffect(() => {
     if (collapsed) document.body.setAttribute('data-dsh-sidebar-collapsed', '')
@@ -171,8 +167,8 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
 
   /**
    * Bottom-panel merge on narrow viewports: whenever a session is current
-   * while narrow (mount, session switch, or a desktop→narrow transition),
-   * throw the bottom tree's tabs into the right tree. Idempotent — after
+   * while narrow (mount, session switch, or a desktop鈫抧arrow transition),
+   * throw the bottom tree's tabs into the right tree. Idempotent —after
    * the first migration the bottom tree is empty and the reducer returns
    * the same reference, so this effect settles immediately.
    */
@@ -204,7 +200,7 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
    * create / close / exit; the sidebar reconciles the list into tabs
    * (id `agent:<uuid>`, title from the agent). A disconnected socket
    * retries with a short backoff so a refresh or transient drop reattaches
-   * the same shell without losing the agent's work — capped like the
+   * the same shell without losing the agent's work —capped like the
    * terminal view's own reconnect loop, so a refused endpoint never spins
    * forever (the next session switch restarts the loop).
    * While the terminal tab type is disabled in settings, pushes are
@@ -212,65 +208,40 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
    */
   useEffect(() => {
     if (sessionId === undefined) return
-    let socket: WebSocket | null = null
-    let retry: number | undefined
-    let closed = false
-    let failures = 0
-    const connect = (): void => {
-      if (closed) return
-      const url = new URL('/sidebar/ws/agent-terminals', location.origin)
-      url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
-      url.search = new URLSearchParams({ sessionId }).toString()
-      socket = new WebSocket(url.toString())
-      socket.onmessage = (event) => {
-        if (typeof event.data !== 'string') return
-        try {
-          const raw = JSON.parse(event.data) as unknown
-          if (!Array.isArray(raw)) return
-          // The push feeds BOTH surfaces: plugin agent terminals (terminal_*
-          // tools, mirrored into sidebar tabs) and HARNESS shell runs
-          // (kind 'harness', listed by the Tasks page only). Tabs mirror
-          // ONLY the plugin terminals — a harness entry has no uuid and must
-          // never become a standalone terminal page.
-          const list = raw.filter((item): item is { uuid: string; title: string } => {
-            if (item === null || typeof item !== 'object') return false
-            const record = item as Record<string, unknown>
-            return record.kind !== 'harness' && typeof record.uuid === 'string'
-          })
-          store.reduce(s => ctx.vscodeSidebar?.isTabEnabled('terminal') === false
-            ? s
-            : reconcileAgentTerminals(s, list))
-        } catch {
-          // Malformed push: ignore (the next push will reconcile).
-        }
+    // The SHARED agent-terminal feed: one socket per session fanned out to
+    // every consumer (this tab mirror + the Tasks page) with a single
+    // reconnect loop — no duplicate connections to the same endpoint.
+    return subscribeAgentTerminalFeed(sessionId, (frame) => {
+      try {
+        const raw = JSON.parse(frame) as unknown
+        if (!Array.isArray(raw)) return
+        // The push feeds BOTH surfaces: plugin agent terminals (terminal_*
+        // tools, mirrored into sidebar tabs) and HARNESS shell runs
+        // (kind 'harness', listed by the Tasks page only). Tabs mirror
+        // ONLY the plugin terminals — a harness entry has no uuid and must
+        // never become a standalone terminal page.
+        const list = raw.filter((item): item is { uuid: string; title: string } => {
+          if (item === null || typeof item !== 'object') return false
+          const record = item as Record<string, unknown>
+          return record.kind !== 'harness' && typeof record.uuid === 'string'
+        })
+        store.reduce(s => ctx.vscodeSidebar?.isTabEnabled('terminal') === false
+          ? s
+          : reconcileAgentTerminals(s, list))
+      } catch {
+        // Malformed push: ignore (the next push will reconcile).
       }
-      socket.onclose = () => {
-        if (closed) return
-        failures += 1
-        if (failures >= FAILURE_LIMIT) {
-          console.error('[dsh-plugin-vscode-sidebar] agent-terminals connection failed; stopping reconnect loop', sessionId)
-          return
-        }
-        retry = window.setTimeout(connect, 2000)
-      }
-      socket.onerror = () => { socket?.close() }
-    }
-    connect()
-    return () => {
-      closed = true
-      window.clearTimeout(retry)
-      socket?.close()
-    }
+    }, true)
   }, [sessionId, store])
 
   /**
    * Subagent auto-activation: the moment the current conversation spawns its
-   * FIRST direct subagent (a 0 → N transition on the list feed), the "auto
+   * FIRST direct subagent (a 0 →N transition on the list feed), the "auto
    * open" pref is on, and the Subagent tab type is enabled in settings,
    * open the panel (if collapsed) and focus the Subagent page
    * (single-instance: an existing tab is focused, never duplicated).
-   * Switching to a session that already has subagents never triggers — its
-   * baseline starts at the current count — so a deliberate layout is never
+   * Switching to a session that already has subagents never triggers —its
+   * baseline starts at the current count —so a deliberate layout is never
    * fought.
    */
   const listBaselineRef = useRef<SidebarSessionList | undefined>(undefined)
@@ -294,9 +265,9 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
    * current conversation (a job id the previous snapshot lacked), the
    * auto-open pref is on, and the Jobs tab type is enabled, open the panel
    * (if collapsed) and focus the Jobs page. Unlike the subagent trigger
-   * (0 → N only), ANY new job id triggers: the agent may start several
+   * (0 →N only), ANY new job id triggers: the agent may start several
    * jobs in one session, and each should surface. A fresh page load never
-   * triggers — its baseline starts at the current snapshot.
+   * triggers —its baseline starts at the current snapshot.
    */
   const jobBaselineRef = useRef<SidebarSessionList | undefined>(undefined)
   useEffect(() => {
@@ -316,7 +287,7 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
    * the official `openSubagent`, which switches the sidebar to that child
    * session's OWN layout (a fresh child session defaults to the explorer).
    * The README contract says the Subagent page must stay open with the jumped
-   * node highlighted — so once the current session becomes the recorded jump
+   * node highlighted —so once the current session becomes the recorded jump
    * target, re-open the Subagent page on top of the child's layout (expanding
    * the panel first if it is collapsed). Only this explicit node click arms
    * the flag, so switching to a subagent session by any other means keeps
@@ -332,20 +303,54 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
     ctx.vscodeSidebar?.openTab({ type: 'subagent', title: t('subagent') })
   }, [sessionId, store, ctx])
 
+  // Tab suspend/resume: the panes keep every tab MOUNTED (hidden tabs keep
+  // their state). When a tab loses/regains visibility, its descriptor's
+  // onSuspend/onResume fire (heavy views unload their hidden content — the
+  // browser tab drops its iframe document). Transitions only: a pure
+  // re-render fires nothing.
+  const suspendStateRef = useRef<Map<string, boolean>>(new Map())
+  useEffect(() => {
+    const state = snapshot.state
+    if (state === undefined) return
+    const current = new Map<string, boolean>()
+    for (const leaf of allLeaves(state.splits).concat(allLeaves(state.bottomSplits))) {
+      for (const tab of leaf.tabs) current.set(tab.id, tab.id === leaf.active)
+    }
+    const scope: SessionScope = { sessionId: sessionId ?? '', cwd }
+    for (const [tabId, wasActive] of suspendStateRef.current) {
+      const isActive = current.get(tabId)
+      if (isActive === undefined || isActive === wasActive) continue
+      // The tab must still exist in the current state to fire (closed tabs
+      // fire nothing — onClose owns that transition).
+      const tab = allLeaves(state.splits).concat(allLeaves(state.bottomSplits))
+        .flatMap(leaf => leaf.tabs)
+        .find(candidate => candidate.id === tabId)
+      if (tab === undefined) continue
+      const descriptor = ctx.vscodeSidebar?.getTab(tab.type)
+      try {
+        if (isActive) descriptor?.onResume?.(tab, scope)
+        else descriptor?.onSuspend?.(tab, scope)
+      } catch (error) {
+        console.warn('[dsh-plugin-vscode-sidebar] suspend/resume callback failed:', error)
+      }
+    }
+    suspendStateRef.current = current
+  }, [snapshot.state, sessionId, cwd, ctx])
+
   // The app shell's center column: the bottom panel spans ONLY that column
-  // ("squeezes the agent output area") — it starts at the app sidebar's
+  // ("squeezes the agent output area") —it starts at the app sidebar's
   // right edge and ends at the details column's left edge (the details
   // column sits between the center and the right panel). Measured directly
   // from the AppFrame's center column DOM (the parent of the
-  // [data-slot="conversation"] wrapper — layout.css's center column) so the
+  // [data-slot="conversation"] wrapper —layout.css's center column) so the
   // bottom panel tracks the column's real
-  // horizontal edges — including the animated margin-right push while the
+  // horizontal edges —including the animated margin-right push while the
   // right panel opens/closes; a frame that never appears keeps the initial
   // zero-size fallback (the panel renders at 0 width until measured).
   const [centerRect, setCenterRect] = useState({ left: 0, right: 0 })
   // Refs keep the measure step stable across renders and let it skip work
   // mid-drag: during a width/corner drag the layout push resizes the center
-  // column every frame, and reacting (setCenterRect → re-render) would
+  // column every frame, and reacting (setCenterRect →re-render) would
   // re-introduce the drag lag this shell deliberately avoids. applyDrag
   // writes the bottom panel's edges directly, so measurement pauses then.
   const centerColRef = useRef<HTMLElement | null>(null)
@@ -369,11 +374,11 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
     // Locate the AppFrame's center column. DSH 0.1.x wraps slot hosts in
     // [data-slot] containers: the conversation slot wrapper
     // ([data-slot="conversation"]) sits directly inside the center column,
-    // so its parent IS that column — no hashed-class or positional
+    // so its parent IS that column —no hashed-class or positional
     // dependency (layout.css uses the same anchor). The shell swaps the
     // boot page for the AppFrame only AFTER boot settles, so the first
     // query may miss it. Never give up: watch #root's children (the swap
-    // mutates them) and re-run this locator — querying once and bailing
+    // mutates them) and re-run this locator —querying once and bailing
     // would strand the panel at the zero-size fallback forever (observed:
     // a 1px sliver at the viewport's left edge).
     const locate = (): void => {
@@ -411,10 +416,10 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
   /**
    * Bottom-panel first-expansion auto terminal: the FIRST time the user
    * expands the bottom panel in a session, try to open a fresh terminal tab
-   * there. "Try" is literal — the terminal's own quota and enable switch
+   * there. "Try" is literal —the terminal's own quota and enable switch
    * gate the attempt (a full quota or a disabled terminal type makes it a
    * no-op). Gated on the bottomPanelAutoTerminal pref (the terminal tab's
-   * nested settings toggle, default on). Only a false→true TRANSITION fires
+   * nested settings toggle, default on). Only a false鈫抰rue TRANSITION fires
    * (a panel persisted open never counts as an expansion), and the session's
    * bottomOpenedOnce flag is set atomically with the first fire so later
    * expansions never repeat it.
@@ -442,7 +447,7 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
   // panel's height (top edge strip), and the shared corner (both at once).
   // Drags write the sizes DIRECTLY to the DOM (panel styles + the layout CSS
   // variables) instead of round-tripping the store on every pointer move —
-  // a store reduce re-renders both workbenches (terminals, editors…) per
+  // a store reduce re-renders both workbenches (terminals, editors— per
   // move, which is the visible drag lag. The store is committed once on
   // pointer up (clamping + persistence).
   const panelRef = useRef<HTMLDivElement | null>(null)
@@ -459,7 +464,7 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
   // Pause center-column measurement while dragging, and re-measure once the
   // drag settles at its committed size. The store commit lands on release and
   // the final width equals the last drag width, so no ResizeObserver event
-  // fires to refresh centerRect — this explicit re-measure covers that gap.
+  // fires to refresh centerRect —this explicit re-measure covers that gap.
   useEffect(() => {
     draggingRef.current = anyDragging
     if (!anyDragging) measureCenter()
@@ -474,14 +479,14 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
 
   /** Apply a drag size to the DOM without touching React state or the store.
    *  The bottom panel's right edge tracks the right panel's left edge HERE
-   *  too — React state only updates on release, so the inline right must be
+   *  too —React state only updates on release, so the inline right must be
    *  written directly or the bottom panel would lag the sidebar mid-drag. */
   const applyDrag = (width: number, height: number): void => {
     panelRef.current?.style.setProperty('width', `${width}px`)
     bottomRef.current?.style.setProperty('height', `${height}px`)
     // centerRect.right is the center column's right edge at the committed
     // width (innerWidth - state.width - detailsWidth), so this equals
-    // `width + detailsWidth` — derived from the measured column, keeping the
+    // `width + detailsWidth` —derived from the measured column, keeping the
     // drag write-only (no React re-render mid-drag).
     bottomRef.current?.style.setProperty('right', `${(window.innerWidth - centerRect.right) + (width - (state?.width ?? 0))}px`)
     document.documentElement.style.setProperty('--dsh-sidebar-width', `${width}px`)
@@ -494,7 +499,7 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
 
   // Drags write at most once per frame: pointer events fire several times
   // faster than the display refresh, and each write reflows the app shell
-  // (the layout push) plus the panels — batching to one write per frame is
+  // (the layout push) plus the panels —batching to one write per frame is
   // what keeps the drag smooth. The store is still committed once on release.
   const dragFrame = useRef<number | null>(null)
   const pendingDrag = useRef<{ width: number; height: number } | null>(null)
@@ -526,7 +531,7 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
   // are squeezed instead of covered. The margins are capped at the viewport
   // so a stale persisted size (e.g. fullscreen on a bigger window) can never
   // crush the app shell to zero. Dragging disables the layout transition.
-  // On NARROW viewports the drawer FLOATS over the app shell — no push, the
+  // On NARROW viewports the drawer FLOATS over the app shell —no push, the
   // conversation keeps the full width behind the drawer.
   useEffect(() => {
     const width = !narrow && snapshot.state?.panelOpen === true
@@ -540,7 +545,7 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
     // Unmount must release the push (issue #31): when the boundary swaps the
     // whole sidebar after a render crash (or the plugin fiber is disposed /
     // HMR), the CSS variables would otherwise stay on <html> and layout.css
-    // keeps squeezing #root with a stale margin — "the sidebar cannot be
+    // keeps squeezing #root with a stale margin —"the sidebar cannot be
     // hidden" until a full reload. removeProperty restores the CSS fallback
     // (var(--dsh-sidebar-width, 0px)); React re-runs cleanup+setup in the
     // same commit on state changes, so there is no visible flicker.
@@ -568,7 +573,7 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
     void paneId
     const current = store.getSnapshot().state
     // Terminal tabs may live in EITHER tree (the bottom panel hosts them
-    // too) — the pty-release lookup covers both, or the HTTP fallback is
+    // too) —the pty-release lookup covers both, or the HTTP fallback is
     // skipped for a bottom-panel terminal whose WS frame never arrived.
     const leaf = current === undefined
       ? undefined
@@ -602,9 +607,9 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
       const tree = state.activePane === 'bottom' ? state.bottomSplits : state.splits
       for (const leaf of allLeaves(tree)) {
         const activeTabId = leaf.active
-        if (activeTabId === null || !isTabDirty(activeTabId)) continue
+        if (activeTabId === null || !store.isTabDirty(activeTabId)) continue
         event.preventDefault()
-        void saveTab(activeTabId)
+        void store.saveTab(activeTabId)
         return
       }
     }
@@ -616,16 +621,16 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
     closeTab: (paneId, tabId) => {
       // VSCode-style unsaved guard: closing a dirty editor tab asks whether
       // to save first (the confirm modal performs the close on Save/Discard)
-      // — unless autoSaveOnClose is on, which saves silently and only asks
+      // —unless autoSaveOnClose is on, which saves silently and only asks
       // when the write itself fails.
-      if (isTabDirty(tabId)) {
+      if (store.isTabDirty(tabId)) {
         const current = store.getSnapshot().state
         const leaf = current === undefined
           ? undefined
           : leafWithTab(current.splits, tabId) ?? leafWithTab(current.bottomSplits, tabId)
         const title = leaf?.tabs.find(candidate => candidate.id === tabId)?.title ?? ''
         if (store.getPrefs().autoSaveOnClose) {
-          void saveTab(tabId).then((saved) => {
+          void store.saveTab(tabId).then((saved) => {
             if (saved) performClose(paneId, tabId)
             else setCloseConfirm({ paneId, tabId, title })
           })
@@ -664,10 +669,10 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
   /**
    * The explorer's @-reference button: append `@<relative path>` to the
    * session's composer draft (space-separated). The conversation service is
-   * resolved lazily through `ctx.get` (the inject-free read — the app's own
+   * resolved lazily through `ctx.get` (the inject-free read —the app's own
    * plugins read 'conversation' the same way); a missing service or scope
    * degrades to a logged no-op, never a crash. Defined above the no-session
-   * early return — a hook must never sit behind a conditional return
+   * early return —a hook must never sit behind a conditional return
    * (React counts hooks per render).
    */
   const referenceInChat = useCallback((path: string): void => {
@@ -704,6 +709,14 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
     service.openTab({ type: optionId, title }, { sessionId, cwd })
   }
 
+  // The + menu options, memoized on the DATA they derive from: the state
+  // tree and the prefs. A prefs/dirty notify that changes neither keeps the
+  // same array reference, so the memoized leaf subtrees skip re-rendering.
+  const newTabOptions = useMemo(
+    () => buildNewTabOptions(state, ctx, { sessionId, cwd }),
+    [state, ctx, sessionId, cwd, snapshot.prefs],
+  )
+
   /**
    * The explorer's @-reference button: append `@<relative path>` to the
    * session's composer draft (space-separated). Resolves the session-scope
@@ -725,7 +738,7 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
 
   /**
    * The tab badge from the tab-type registry: a count (99+ capped) or a
-   * short text pill. A throwing badge is swallowed (no pill) — the tab
+   * short text pill. A throwing badge is swallowed (no pill) —the tab
    * strip must never break because a plugin's badge computation failed.
    */
   const tabBadgeOf = (tab: SidebarTab): ReactNode => {
@@ -771,7 +784,7 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
       {/*
         The persistent toggle cluster at the top-right corner: the bottom
         panel's button (bottom glyph) LEFT of the right panel's (side glyph).
-        Always pinned to the viewport corner — inside the right panel's
+        Always pinned to the viewport corner —inside the right panel's
         top-right while it is open, sitting flush in the tab strip whose
         right end it really squeezes (the strip reserves its width via CSS),
         so the tabs genuinely yield space to it.
@@ -808,10 +821,10 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
         The right panel stays mounted while collapsed (hidden off-screen) so
         the slide in/out can animate; visibility hides it after the slide
         settles. Its bottom edge follows the bottom panel's height (0 while
-        the bottom panel is closed) — the VSCode-style "sidebar above panel".
+        the bottom panel is closed) —the VSCode-style "sidebar above panel".
         On NARROW viewports it is a full-width drawer holding both
         workbenches (see MobileWorkbench); the width drag strip is not
-        offered there — a full-screen sheet has nothing to drag.
+        offered there —a full-screen sheet has nothing to drag.
       */}
       <div
         ref={panelRef}
@@ -848,12 +861,13 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
         <div className={css.panelBody}>
           <Workbench
             state={state}
-            newTabOptions={buildNewTabOptions(state, ctx, { sessionId, cwd })}
+            newTabOptions={newTabOptions}
             actions={actions}
             onNewTab={onNewTab}
             renderTab={renderTab}
             getTabIcon={tabIconOf}
             getTabBadge={tabBadgeOf}
+            isDirty={(tabId) => store.isTabDirty(tabId)}
           />
         </div>
       </div>
@@ -881,7 +895,7 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
           right: window.innerWidth - centerRect.right,
           // The seam against the open right panel needs its own hairline
           // (the right panel's border-left alone is covered by this panel's
-          // fill — without it the corner looks cut off).
+          // fill —without it the corner looks cut off).
           borderRight: state.panelOpen ? '1px solid var(--dsw-alias-border-l2)' : undefined,
         }}
         data-dragging={(draggingBottom || draggingCorner) || undefined}
@@ -928,12 +942,13 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
           <Workbench
             state={state}
             tree={state.bottomSplits}
-            newTabOptions={buildNewTabOptions(state, ctx, { sessionId, cwd })}
+            newTabOptions={newTabOptions}
             actions={actions}
             onNewTab={onNewTab}
             renderTab={(tab, active, paneId) => renderTab(tab, active, paneId, true)}
             getTabIcon={tabIconOf}
             getTabBadge={tabBadgeOf}
+            isDirty={(tabId) => store.isTabDirty(tabId)}
           />
         </div>
       </div>
@@ -942,7 +957,7 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
         The shared corner (only while BOTH panels are open): the intersection
         of the right panel's left edge and the bottom panel's top edge.
         Horizontal drags resize the right panel's width, vertical drags the
-        bottom panel's height — the two panels drag against each other.
+        bottom panel's height —the two panels drag against each other.
         (Never on narrow viewports: the bottom panel does not exist there.)
       */}
       {!narrow && state.panelOpen && state.bottomOpen && (
@@ -1004,7 +1019,7 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
               const pending = closeConfirm
               if (pending === null) return
               setCloseConfirm(null)
-              void saveTab(pending.tabId).then((saved) => {
+              void store.saveTab(pending.tabId).then((saved) => {
                 if (saved) performClose(pending.paneId, pending.tabId)
               })
             }}>

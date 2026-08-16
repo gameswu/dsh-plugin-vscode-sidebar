@@ -14,6 +14,7 @@ import type { Context } from '../context-types.ts'
 import { api, mediaUrl, type SessionScope } from './api.ts'
 import { BinaryDownload } from './binary-download.tsx'
 import { planFirstMatch, planFsReadOutcome, type EditorLoadAction } from './editor-load.ts'
+import { prefetchBundleAsset } from './chunk-loader.ts'
 import { t } from './locales.ts'
 import { FileTypeIcon, fileBaseName } from './file-icons.tsx'
 import type { FileViewerDescriptor } from './service.ts'
@@ -37,6 +38,14 @@ export function EditorHost(props: {
 }) {
   const { ctx, store, scope, path, title, tabId } = props
   const [load, setLoad] = useState<EditorLoad>({ status: 'loading' })
+
+  // Predictive warm-up: an editor tab is about to open a file — prefetch the
+  // monaco chunk and its worker on idle so the first edit does not pay the
+  // multi-MB download.
+  useEffect(() => {
+    prefetchBundleAsset('editor')
+    prefetchBundleAsset('editor-worker')
+  }, [])
 
   useEffect(() => {
     let cancelled = false

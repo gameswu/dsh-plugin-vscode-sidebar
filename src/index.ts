@@ -41,7 +41,7 @@ import { defaultShell, ensureSpawnHelper, PtyManager } from './pty-manager.ts'
 import { AgentPtyRegistry, clampDims, type AgentTerminalHandle } from './agent-pty.ts'
 import { registerTools } from './tools.ts'
 import { buildJobsApi, type SidebarJobsRoutes } from './jobs-routes.ts'
-import { listTerminalRuns, terminalRunOf } from './terminal-runs.ts'
+import { listTerminalRuns, subscribeTerminalRuns, terminalRunOf } from './terminal-runs.ts'
 import { readJsonBody, requireString, SidebarError, writeError, writeJson, writeOk } from './wire.ts'
 
 export { Config }
@@ -80,6 +80,12 @@ const MEDIA_TYPES: Record<string, string> = {
   '.pdf': 'application/pdf',
   '.html': 'text/html',
   '.htm': 'text/html',
+  '.mp4': 'video/mp4',
+  '.webm': 'video/webm',
+  '.mov': 'video/quicktime',
+  '.m4v': 'video/x-m4v',
+  '.ogv': 'video/ogg',
+  '.mkv': 'video/x-matroska',
 }
 
 /** Content type served by /sidebar/file (binary-safe fallback for unknowns). */
@@ -92,6 +98,28 @@ const GIT_STATUS_CACHE_MS = 3_000
 
 /** Per-repo porcelain status cache (repo root → snapshot time + XY map). */
 const repoStatusCache = new Map<string, { at: number; map: Map<string, string> }>()
+
+/** How long one directory listing serves (the explorer's auto-refresh stays
+ *  cheap while mutations invalidate their own parents immediately). */
+const FS_LIST_CACHE_MS = 2_000
+
+/** Per-session directory-listing cache (session|path → time + listing). */
+const fsListCache = new Map<string, { at: number; listing: unknown }>()
+
+/** How long one repo-DISCOVERY walk serves (walking large worktrees is the
+ *  multi-repo panel's main wait; explicit refreshes pass force and bypass). */
+const REPO_DISCOVERY_CACHE_MS = 30_000
+
+/** Repo-discovery cache keyed by cwd + depth + excludes (config changes miss
+ *  naturally; `force` refreshes bypass the TTL). */
+const repoDiscoveryCache = new Map<string, { at: number; repos: unknown }>()
+
+/** Drop the cached listings of one directory (and nothing else). */
+function invalidateFsCache(dir: string): void {
+  for (const key of fsListCache.keys()) {
+    if (key.endsWith(`|${dir}`)) fsListCache.delete(key)
+  }
+}
 
 /**
  * Resolve a session's authoritative working directory. The attached session
@@ -227,6 +255,33 @@ function buildApi(
   }
   /** The user-configured extra exclusions for repo discovery (git tab settings). */
   const repoExcludes = (): string[] => git.parseExcludePatterns(getPrefs().pluginSettings['git']?.gitRepoExcludePatterns)
+  /** The user-configured nested-repo scan depth (git tab settings; default 3). */
+  const repoScanDepth = (): number => {
+    const raw = getPrefs().pluginSettings['git']?.gitRepoScanDepth
+    const value = typeof raw === 'number' && Number.isFinite(raw) ? Math.round(raw) : 3
+    return Math.min(10, Math.max(1, value))
+  }
+  /** Severity of one porcelain XY for directory propagation (VSCode-style:
+   *  a changed child paints its parent with the most severe change). */
+  const gitSeverity = (xy: string): number => {
+    const letter = xy[0] !== undefined && xy[0] !== ' ' && xy[0] !== '?' ? xy[0] : xy[1]
+    if (letter === 'D') return 4
+    if (letter === 'M' || letter === 'R' || letter === 'C') return 3
+    if (letter === 'A' || letter === 'U') return 2
+    return 1
+  }
+  /** TTL-cached repo discovery (keyed by cwd + depth + excludes, so a config
+   *  change misses naturally; `force` (manual refresh) bypasses the TTL). */
+  const discoverReposCached = async (cwd: string, excludes: readonly string[], depth: number, force: boolean): Promise<unknown> => {
+    const key = `${cwd}|${depth}|${excludes.join(',')}`
+    const cached = repoDiscoveryCache.get(key)
+    if (!force && cached !== undefined && Date.now() - cached.at < REPO_DISCOVERY_CACHE_MS) {
+      return cached.repos
+    }
+    const repos = await git.discoverRepos(cwd, { excludes: [...excludes], maxDepth: depth })
+    repoDiscoveryCache.set(key, { at: Date.now(), repos })
+    return repos
+  }
   // Background jobs: the LIST rides the harness's `session/jobs` push
   // mirror, so these routes only replay output the model has read (from the
   // session's own event log — no DSH source is touched, the model's
@@ -248,9 +303,17 @@ function buildApi(
       return { sessionId, cwd, root: rootLabel(cwd), parent: parentOf(cwd) ?? null }
     },
     'fs.tree': async (payload) => {
-      const { cwd } = cwdOf(payload)
+      const { sessionId, cwd } = cwdOf(payload)
       const record = payload as { path?: unknown }
       const target = record.path === undefined ? cwd : requireAbsolute(requireString(payload, 'path'))
+      // Short-TTL listing cache: the explorer's 5s auto-refresh would
+      // otherwise re-list every expanded level (each a stat+readdir) for
+      // nothing; mutations invalidate their own directory instantly.
+      const cacheKey = `${sessionId}|${target}`
+      const cachedListing = fsListCache.get(cacheKey)
+      if (cachedListing !== undefined && Date.now() - cachedListing.at < FS_LIST_CACHE_MS) {
+        return cachedListing.listing
+      }
       const listing = await listDirectory(target, resolved.listLimit)
       // Visibility follows git, not POSIX dotfiles: inside a work tree the
       // entries the enclosing repository ignores (.gitignore/exclude) are
@@ -283,9 +346,23 @@ function buildApi(
               }
             }
             if (statusMap.size > 0) {
+              // VSCode-style parent propagation: every ancestor directory of
+              // a changed path inherits the MOST SEVERE change below it, so a
+              // dirty subtree is visible from its collapsed parent.
+              const dirStatus = new Map<string, string>()
+              for (const [rel, xy] of statusMap) {
+                const parts = rel.split('/')
+                for (let index = 0; index < parts.length - 1; index += 1) {
+                  const dirRel = parts.slice(0, index + 1).join('/')
+                  const current = dirStatus.get(dirRel)
+                  if (current === undefined || gitSeverity(xy) > gitSeverity(current)) {
+                    dirStatus.set(dirRel, xy)
+                  }
+                }
+              }
               listing.entries = listing.entries.map((entry) => {
                 const rel = relative(repo, entry.path).replace(/\\/g, '/')
-                const xy = statusMap.get(rel)
+                const xy = entry.isDir ? dirStatus.get(rel) : statusMap.get(rel)
                 return xy === undefined ? entry : { ...entry, git: xy }
               })
             }
@@ -294,6 +371,7 @@ function buildApi(
       } catch {
         // Fail-open: a broken git binary must never dim/undecorate the directory.
       }
+      fsListCache.set(cacheKey, { at: Date.now(), listing })
       return listing
     },
     'fs.read': async (payload) => {
@@ -332,6 +410,7 @@ function buildApi(
       try {
         if ((payload as { isDir?: unknown }).isDir === true) await mkdir(target)
         else await writeFile(target, '', { encoding: 'utf8', flag: 'wx' })
+        invalidateFsCache(dir)
       } catch (error) {
         const code = (error as NodeJS.ErrnoException).code
         throw new SidebarError(
@@ -354,6 +433,7 @@ function buildApi(
       if (target === path) return { ok: true, path }
       try {
         await rename(path, target)
+        invalidateFsCache(dirname(path))
       } catch (error) {
         const code = (error as NodeJS.ErrnoException).code
         throw new SidebarError(
@@ -379,6 +459,8 @@ function buildApi(
       if (target === path) return { ok: true, path }
       try {
         await rename(path, target)
+        invalidateFsCache(dirname(path))
+        invalidateFsCache(toDir)
       } catch (error) {
         const code = (error as NodeJS.ErrnoException).code
         throw new SidebarError(
@@ -395,13 +477,15 @@ function buildApi(
       if (!isWithin(cwd, path)) throw new SidebarError('fs-error', 'target outside the session working directory', 403)
       if (isWithin(path, cwd)) throw new SidebarError('fs-error', 'refusing to delete the session working directory', 400)
       await rm(path, { recursive: true, force: false })
+      invalidateFsCache(dirname(path))
       return { ok: true }
     },
     'git.status': async (payload) => {
       const { cwd } = cwdOf(payload)
       // Discovered repositories (enclosing first, nested ones after) so the
-      // panel can offer a repo picker even when the cwd itself is not a repo.
-      const repos = await git.discoverRepos(cwd, { excludes: repoExcludes() })
+      // panel can list every repo; the walk is TTL-cached (30s) — walking a
+      // large worktree per request is the multi-repo panel's main latency.
+      const repos = await discoverReposCached(cwd, repoExcludes(), repoScanDepth(), false)
       const repo = await repoOf(payload, cwd)
       if (repo === null) return { isRepo: false, repos, entries: [] }
       const result = await git.status(repo)
@@ -413,6 +497,14 @@ function buildApi(
         // and the context menu copies it without re-resolving on the client.
         entries: result.entries.map(entry => ({ ...entry, absPath: join(repo, entry.path) })),
       }
+    },
+    'git.repos': async (payload) => {
+      // Discovery ONLY — the multi-repo panel lists every scanned repository
+      // without computing status for any of them (collapsed repos stay free).
+      const { cwd } = cwdOf(payload)
+      const force = (payload as { force?: unknown }).force === true
+      const repos = await discoverReposCached(cwd, repoExcludes(), repoScanDepth(), force)
+      return { repos }
     },
     'git.diff': async (payload) => {
       const { cwd } = cwdOf(payload)
@@ -1011,36 +1103,33 @@ async function attachHarnessTerminal(
       ws.close(1008, 'sessionId and id are required')
       return
     }
-    // Shell-run mode: replay the command header, then poll the event log
-    // for the paired result; on settle, push the output and the sentinel.
+    // Shell-run mode: replay the command header, then stream EVENT-DRIVEN on
+    // the session event mirror — no polling: the moment the paired result
+    // lands, the output and the exit sentinel push immediately.
     const run = terminalRunOf(ctx, sessionId, id)
     if (run !== undefined) {
-      let settled = run.settled
       if (run.command !== '') {
         ws.send(`$ ${run.command}\n`)
       }
-      if (settled && run.text !== '') ws.send(run.text)
-      if (settled) {
-        ws.send('\r\n[process exited]\r\n')
-        ws.close()
-        return
-      }
-      let timer: ReturnType<typeof setInterval> | undefined
-      const pull = (): void => {
+      let settled = run.settled
+      const off = subscribeTerminalRuns(() => {
         if (settled) return
         const current = terminalRunOf(ctx, sessionId, id)
-        if (current === undefined) return
-        if (current.settled) {
-          settled = true
-          if (current.text !== '' && ws.readyState === WebSocket.OPEN) ws.send(current.text)
-          if (ws.readyState === WebSocket.OPEN) ws.send('\r\n[process exited]\r\n')
-          if (timer !== undefined) clearInterval(timer)
-          ws.close()
-        }
+        if (current === undefined || !current.settled) return
+        settled = true
+        if (current.text !== '' && ws.readyState === WebSocket.OPEN) ws.send(current.text)
+        if (ws.readyState === WebSocket.OPEN) ws.send('\r\n[process exited]\r\n')
+        off()
+        ws.close()
+      })
+      ws.on('close', () => { settled = true; off() })
+      ws.on('error', () => { settled = true; off() })
+      if (settled) {
+        if (run.text !== '' && ws.readyState === WebSocket.OPEN) ws.send(run.text)
+        if (ws.readyState === WebSocket.OPEN) ws.send('\r\n[process exited]\r\n')
+        off()
+        ws.close()
       }
-      timer = setInterval(pull, 600)
-      ws.on('close', () => { settled = true; if (timer !== undefined) clearInterval(timer) })
-      ws.on('error', () => { settled = true; if (timer !== undefined) clearInterval(timer) })
       return
     }
     // Registry-backed PTY mode (optional surface).

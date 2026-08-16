@@ -161,6 +161,10 @@ export const api = {
     call<{ ok: true }>('fs.delete', scopePayload(scope, { path })),
   gitStatus: (scope: SessionScope, repo?: string, signal?: AbortSignal) =>
     call<GitStatusResult>('git.status', repoPayload(scope, repo, {}), signal),
+  /** Discovered repositories only (no status computation — the multi-repo
+   *  panel's list). `force` bypasses the host's 30s discovery TTL. */
+  gitRepos: (scope: SessionScope, force?: boolean, signal?: AbortSignal) =>
+    call<{ repos: GitRepoInfo[] }>('git.repos', scopePayload(scope, { ...(force === true ? { force: true } : {}) }), signal),
   gitDiff: (scope: SessionScope, path: string | undefined, staged: boolean, repo?: string, signal?: AbortSignal) =>
     call<{ diff: string }>('git.diff', repoPayload(scope, repo, { ...(path !== undefined ? { path } : {}), staged }), signal),
   gitStage: (scope: SessionScope, path?: string, repo?: string) =>

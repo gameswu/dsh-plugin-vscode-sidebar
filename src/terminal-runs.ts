@@ -106,6 +106,16 @@ export function terminalRunTraceOf(event: SidebarSessionEvent): TerminalRunTrace
 /** Per-session cap of mirrored live traces (a bounded, lossy ring). */
 const MIRROR_MAX_ENTRIES = 200
 
+/** Mirror-append listeners (the event-driven stream feeds on these — zero
+ *  polling: a settle pushes the output the instant the result lands). */
+const runListeners = new Set<() => void>()
+
+/** Subscribe to shell-run append events (mirror pushes, not the store log). */
+export function subscribeTerminalRuns(listener: () => void): () => void {
+  runListeners.add(listener)
+  return () => { runListeners.delete(listener) }
+}
+
 /**
  * The live shell-run mirror: subscribes to the session append feed and
  * caches the traces the session store's own log can lag behind (after a
@@ -132,6 +142,7 @@ function createTerminalRunMirror(ctx: Context): { entries(sessionId: string): re
         if (ids.size === 0) callIds.delete(sessionId)
       }
     }
+    for (const listener of [...runListeners]) listener()
   }
   const dispose = ctx.on('session/event', (session, event) => {
     const sessionId = (session as { id?: unknown } | null)?.id

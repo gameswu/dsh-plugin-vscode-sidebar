@@ -25,7 +25,7 @@ import { HtmlPreview } from './HtmlPreview.tsx'
 import { MarkdownPreview } from './MarkdownPreview.tsx'
 import { appendToDraft } from './conversation-draft.ts'
 import { buildSelectionInsert, linesOfSelection } from './selection-payload.ts'
-import { registerEditorTab, setTabDirty } from './dirty-tabs.ts'
+import { registerSave, setDirty } from './dirty-bridge.ts'
 import { t } from './locales.ts'
 import type { FileViewerProps } from './service.ts'
 import css from './sidebar.module.css'
@@ -109,7 +109,7 @@ export function TextEditor(props: FileViewerProps) {
     try {
       await api.fsWrite(scope, path, model.getValue())
       setDraft(null)
-      if (tabId !== undefined) setTabDirty(tabId, false)
+      if (tabId !== undefined) setDirty(tabId, false)
       setSaveState('saved')
       return true
     } catch {
@@ -122,10 +122,15 @@ export function TextEditor(props: FileViewerProps) {
 
   useEffect(() => { saveRef.current = save }, [save])
 
-  // The tab shell saves this tab on close-confirm / global Ctrl+S.
+  // The tab shell saves this tab on close-confirm / global Ctrl+S. The
+  // registration and the dirty writes go DIRECTLY to the window-scoped
+  // dirty bridge: the shell reads the same window object through the
+  // store's delegation, so this lazy chunk and the shell can never hold
+  // two disjoint registries — no module-instance or version-mix can
+  // desync them.
   useEffect(() => {
     if (tabId === undefined) return
-    return registerEditorTab(tabId, () => saveRef.current())
+    return registerSave(tabId, () => saveRef.current())
   }, [tabId])
 
   // Create the Monaco editor once the content is loaded. Monaco owns the
@@ -141,7 +146,11 @@ export function TextEditor(props: FileViewerProps) {
     const model = monaco.editor.createModel(
       content,
       undefined,
-      monaco.Uri.parse(`file:///${path.replace(/\\/g, '/')}`),
+      // Uri.file handles platform paths correctly — a hand-built
+      // `file:///${path}` breaks POSIX paths (a leading '/' yields
+      // `file:////…`, whose authority-less path starts with '//' and
+      // throws UriError on macOS/Linux).
+      monaco.Uri.file(path),
     )
     const editor = monaco.editor.create(host, {
       model,
@@ -158,7 +167,7 @@ export function TextEditor(props: FileViewerProps) {
     const contentSub = model.onDidChangeContent(() => {
       const text = model.getValue()
       setDraft(text)
-      if (tabId !== undefined) setTabDirty(tabId, text !== content)
+      if (tabId !== undefined) setDirty(tabId, text !== content)
     })
     // VSCode's Ctrl/Cmd+S: save through the host route.
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => { saveRef.current() })

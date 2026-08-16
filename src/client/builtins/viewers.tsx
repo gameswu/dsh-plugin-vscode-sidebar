@@ -1,6 +1,6 @@
 /**
- * The 6 built-in file viewer descriptors: every preview surface is a
- * registered viewer (image / pdf / markdown / html / code /
+ * The 7 built-in file viewer descriptors: every preview surface is a
+ * registered viewer (image / video / pdf / markdown / html / code /
  * binary-download), exactly like external plugins register theirs. Office
  * previews (.docx / .xlsx / .pptx) are NOT built in anymore — they moved to
  * the recommended office plugin (see plugins-viewers.ts), which registers
@@ -26,11 +26,13 @@ import { IconCodeOutline16, IconDownloadOutline16 } from '@deepseek-ai/dsh-clien
 import { lazyChunkComponent } from '../lazy-chunk.tsx'
 import { PdfView } from '../PdfView.tsx'
 import { BinaryDownload } from '../binary-download.tsx'
+import { ImageViewer } from '../ImageViewer.tsx'
 import {
   IconImageOutline16,
   IconMarkdownOutline16,
   IconPdfOutline16,
   IconHtmlOutline16,
+  IconVideoOutline16,
 } from '../icons.tsx'
 import type { ComponentType } from 'react'
 import type { FileViewerDescriptor, FileViewerProps } from '../service.ts'
@@ -45,7 +47,7 @@ import css from '../sidebar.module.css'
  */
 const LazyTextEditor = lazyChunkComponent<FileViewerProps>('editor', (mod) => mod.TextEditor as ComponentType<FileViewerProps> | undefined)
 
-/** The 6 built-in file viewer descriptors. */
+/** The 7 built-in file viewer descriptors. */
 export function builtinViewers(): readonly FileViewerDescriptor[] {
   return [
     {
@@ -55,8 +57,18 @@ export function builtinViewers(): readonly FileViewerDescriptor[] {
       exts: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico', 'avif'],
       fetchStrategy: 'mediaUrl',
       component: ({ mediaUrl: url, title }) => (
-        <div className={css.editorImageWrap}>
-          <img className={css.editorImage} src={url} alt={title} />
+        <ImageViewer url={url ?? ''} title={title} />
+      ),
+    },
+    {
+      id: 'video',
+      title: () => t('viewerVideo'),
+      icon: (size: number) => <IconVideoOutline16 size={size} />,
+      exts: ['mp4', 'webm', 'mov', 'm4v', 'ogv', 'mkv'],
+      fetchStrategy: 'mediaUrl',
+      component: ({ mediaUrl: url, title }) => (
+        <div className={css.editorVideoWrap}>
+          <video className={css.editorVideo} src={url} controls playsInline preload="metadata" aria-label={title} />
         </div>
       ),
     },

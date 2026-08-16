@@ -197,6 +197,15 @@ export interface TabDescriptor {
   onOpen?: (tab: SidebarTab, scope: SessionScope) => void
   onActivate?: (tab: SidebarTab, scope: SessionScope) => void
   onClose?: (tab: SidebarTab, scope: SessionScope) => void
+  /**
+   * Suspend/resume seam (v0.1.1+): fired by the SHELL when a mounted tab
+   * loses or regains visibility inside its pane (the pane keeps every tab
+   * mounted — these callbacks let a heavy view unload its expensive content
+   * while hidden, e.g. the browser tab drops its iframe document). A
+   * throwing callback is logged and never breaks the render.
+   */
+  onSuspend?: (tab: SidebarTab, scope: SessionScope) => void
+  onResume?: (tab: SidebarTab, scope: SessionScope) => void
   component: (props: TabComponentProps) => ReactNode
 }
 
@@ -383,7 +392,7 @@ function baseNameOf(path: string): string {
  * The plugin version this service instance reports. Keep in lockstep with
  * `package.json`'s version — `tests/service.spec.ts` asserts the pair.
  */
-export const SIDEBAR_SERVICE_VERSION = '0.1.0'
+export const SIDEBAR_SERVICE_VERSION = '0.1.1'
 
 /**
  * Monotonic capability list consumers use to gate new API usage (features

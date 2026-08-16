@@ -435,10 +435,14 @@ export function SideCardSection({ store, service }: SideCardSectionProps) {
     setWidthDraft(String(settled.defaultWidthPercent))
   }
 
-  /** Optimistically apply one pref patch, then commit (revert on failure). */
+  /** Optimistically apply one pref patch, then commit (revert on failure).
+   *  A patch that changes nothing (same value re-selected) skips the write
+   *  entirely — no revision bump, no full-tree re-render, no settings
+   *  document churn. */
   const applyPref = (patch: Record<string, unknown>): void => {
     const previous = optimisticRef.current
     const next = { ...previous, ...patch } as SidebarPrefs
+    if (JSON.stringify(next) === JSON.stringify(previous)) return
     optimisticRef.current = next
     setPrefs(next)
     setError(null)

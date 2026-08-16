@@ -173,19 +173,44 @@ export function ExplorerView(props: {
     for (const dir of expanded) loadDir(dir)
   }, [cwd, expanded, refreshTick, loadDir])
 
-  // Auto-refresh: while the page is visible the loaded levels refetch on a
-  // fixed cadence and on window focus (files change outside the sidebar too
-  // — the agent writes them). Invisible pages skip the polling entirely.
+  // Auto-refresh: while the page is visible the loaded levels refetch on an
+  // ADAPTIVE cadence — 5s normally, doubling after every tick whose data
+  // signature did not change (capped at 20s), snapping back to 5s the moment
+  // anything moved or the window regains focus. Idle sessions stop hammering
+  // the API; active ones stay fresh. Invisible pages skip entirely.
+  const signatureOf = useCallback((): string => {
+    let sig = ''
+    for (const key of Object.keys(dataRef.current).sort()) {
+      const entries = dataRef.current[key]?.entries ?? []
+      sig += `${key}:${entries.map(entry => `${entry.name}${entry.git ?? ''}${entry.hidden ? 'h' : ''}`).join(',')}|`
+    }
+    return sig
+  }, [])
   useEffect(() => {
     if (!visible) return
-    const timer = window.setInterval(() => { setRefreshTick(tick => tick + 1) }, REFRESH_INTERVAL_MS)
-    const onFocus = (): void => { setRefreshTick(tick => tick + 1) }
+    let stable = 0
+    let timer: number | undefined
+    let lastSignature = signatureOf()
+    const tick = (): void => {
+      const current = signatureOf()
+      stable = current === lastSignature ? stable + 1 : 0
+      lastSignature = current
+      setRefreshTick(value => value + 1)
+      const delay = Math.min(REFRESH_INTERVAL_MS * 2 ** Math.min(stable, 2), REFRESH_INTERVAL_MS * 4)
+      timer = window.setTimeout(tick, delay)
+    }
+    const onFocus = (): void => {
+      stable = 0
+      window.clearTimeout(timer)
+      tick()
+    }
+    timer = window.setTimeout(tick, REFRESH_INTERVAL_MS)
     window.addEventListener('focus', onFocus)
     return () => {
-      window.clearInterval(timer)
+      window.clearTimeout(timer)
       window.removeEventListener('focus', onFocus)
     }
-  }, [visible])
+  }, [visible, signatureOf])
 
   /** Copy `text`; on success flip the row's copied label for a moment. */
   const copyPath = useCallback((text: string, path: string): void => {

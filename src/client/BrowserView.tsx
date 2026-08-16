@@ -44,7 +44,7 @@ export const BROWSER_IFRAME_SANDBOX =
   'allow-scripts allow-forms allow-popups allow-downloads allow-modals allow-popups-to-escape-sandbox'
 
 export function BrowserView(props: TabComponentProps) {
-  const { store, tab } = props
+  const { store, tab, visible } = props
   // The current address (initialized from the persisted tab.path so a
   // reload restores the visited page).
   const [url, setUrl] = useState<string | undefined>(tab.path)
@@ -209,7 +209,11 @@ export function BrowserView(props: TabComponentProps) {
         <iframe
           key={`${reloadKey}:${noSandbox ? 'ns' : 'sb'}`}
           className={css.browserFrame}
-          src={url}
+          // Hidden tabs SUSPEND: the pane keeps every tab mounted, so a
+          // hidden browser tab drops its document (about:blank) and reloads
+          // on return — memory-heavy pages stop consuming resources while
+          // the user is elsewhere.
+          src={visible === false ? 'about:blank' : url}
           sandbox={noSandbox ? undefined : BROWSER_IFRAME_SANDBOX}
           referrerPolicy="no-referrer"
           allow=""

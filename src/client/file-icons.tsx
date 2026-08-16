@@ -7,7 +7,7 @@
  * the icon is missing or the route is unreachable, so the explorer never
  * loses its rows to a broken icon.
  */
-import { useState, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import {
   IconCodeOutline16, IconFolderClose16, IconFolderOpen16,
 } from '@deepseek-ai/dsh-client-ui-primitives'
@@ -45,15 +45,32 @@ export function rootFolderIconName(folderName: string, open: boolean): string {
   return open ? DEFAULT_ROOT_OPENED : DEFAULT_ROOT
 }
 
+/** In-memory icon fetch cache: one network fetch per icon name per page
+ *  session; later mounts reuse the same blob URL (the explorer renders many
+ *  identical file-type icons across rows and sessions). */
+const iconBlobCache = new Map<string, string>()
+
 /** One icon <img> with a fallback: on load failure the fallback glyph shows. */
 function IconImg({ src, size, fallback }: { src: string; size: number; fallback: ReactNode }): ReactNode {
   const [failed, setFailed] = useState(false)
+  const [cachedSrc, setCachedSrc] = useState<string | undefined>(() => iconBlobCache.get(src))
+  useEffect(() => {
+    if (cachedSrc !== undefined || failed) return
+    let cancelled = false
+    void fetch(src).then(response => response.blob()).then((blob) => {
+      if (cancelled) return
+      const url = URL.createObjectURL(blob)
+      iconBlobCache.set(src, url)
+      setCachedSrc(url)
+    }).catch(() => { /* fall back to the direct URL; onError handles misses */ })
+    return () => { cancelled = true }
+  }, [src, cachedSrc, failed])
   if (failed) return fallback
   return (
     <img
       className={css.fileIcon}
       style={{ width: size, height: size }}
-      src={src}
+      src={cachedSrc ?? src}
       alt=""
       draggable={false}
       loading="lazy"

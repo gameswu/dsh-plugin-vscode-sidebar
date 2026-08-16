@@ -9,7 +9,7 @@
  * that merges the tab into the pane. The tree and all operations live in
  * state.ts; this file is pure presentation over them.
  */
-import { Fragment, useEffect, useRef, useState } from 'react'
+import { Fragment, memo, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import clsx from 'clsx'
 import type { SidebarState, SidebarTab, SplitNode } from './state.ts'
@@ -115,8 +115,12 @@ function PaneEmptyCards(props: {
   )
 }
 
-/** A leaf: tab strip + active content + VSCode-style drop target for tabs. */
-function LeafView(props: {
+/** A leaf: tab strip + active content + VSCode-style drop target for tabs.
+ *  Memoized on the DATA props only (leaf, newTabOptions, actions): prefs/
+ *  dirty/badge notifies keep those references unchanged, so the whole leaf
+ *  subtree — tab strip AND every mounted tab content — skips the re-render
+ *  cascade those notifications used to cause. */
+const LeafView = memo(function LeafView(props: {
   leaf: { id: string; tabs: SidebarTab[]; active: string | null }
   newTabOptions: NewTabOption[]
   actions: WorkbenchActions
@@ -124,8 +128,9 @@ function LeafView(props: {
   renderTab: (tab: SidebarTab, active: boolean, paneId: string) => ReactNode
   getTabIcon?: (tab: SidebarTab) => ReactNode
   getTabBadge?: (tab: SidebarTab) => ReactNode
+  isDirty: (tabId: string) => boolean
 }) {
-  const { leaf, newTabOptions, actions, onNewTab, renderTab, getTabIcon, getTabBadge } = props
+  const { leaf, newTabOptions, actions, onNewTab, renderTab, getTabIcon, getTabBadge, isDirty } = props
   const [dropZone, setDropZone] = useState<DropZone | null>(null)
   const activeTab = leaf.tabs.find(tab => tab.id === leaf.active) ?? leaf.tabs[leaf.tabs.length - 1]
 
@@ -180,6 +185,7 @@ function LeafView(props: {
         newTabOptions={newTabOptions}
         getTabIcon={getTabIcon}
         getTabBadge={getTabBadge}
+        isDirty={isDirty}
         onDropTab={(payload, before) => {
           if (before === null) actions.moveTabToEdge(payload, leaf.id, 'center')
           else actions.moveTabBefore(payload, leaf.id, before)
@@ -208,7 +214,14 @@ function LeafView(props: {
       )}
     </div>
   )
-}
+}, (prev, next) =>
+  // The DATA props decide: leaf identity (tabs/active changes), the
+  // memoized + menu options, and the memoized actions object. Everything
+  // else (callbacks, resolvers) is recreated per render and must not force
+  // a re-render of the leaf subtree.
+  prev.leaf === next.leaf
+  && prev.newTabOptions === next.newTabOptions
+  && prev.actions === next.actions)
 
 /** Recursive node renderer. */
 function NodeView(props: {
@@ -220,8 +233,9 @@ function NodeView(props: {
   renderTab: (tab: SidebarTab, active: boolean, paneId: string) => ReactNode
   getTabIcon?: (tab: SidebarTab) => ReactNode
   getTabBadge?: (tab: SidebarTab) => ReactNode
+  isDirty: (tabId: string) => boolean
 }) {
-  const { node, state, newTabOptions, actions, onNewTab, renderTab, getTabIcon, getTabBadge } = props
+  const { node, state, newTabOptions, actions, onNewTab, renderTab, getTabIcon, getTabBadge, isDirty } = props
   if (node.kind === 'leaf') {
     return (
       <LeafView
@@ -232,6 +246,7 @@ function NodeView(props: {
         renderTab={renderTab}
         getTabIcon={getTabIcon}
         getTabBadge={getTabBadge}
+        isDirty={isDirty}
       />
     )
   }
@@ -259,6 +274,7 @@ function NodeView(props: {
               renderTab={renderTab}
               getTabIcon={getTabIcon}
               getTabBadge={getTabBadge}
+              isDirty={isDirty}
             />
           </div>
         </Fragment>
@@ -280,8 +296,9 @@ export function Workbench(props: {
   renderTab: (tab: SidebarTab, active: boolean, paneId: string) => ReactNode
   getTabIcon?: (tab: SidebarTab) => ReactNode
   getTabBadge?: (tab: SidebarTab) => ReactNode
+  isDirty: (tabId: string) => boolean
 }) {
-  const { state, tree, newTabOptions, actions, onNewTab, renderTab, getTabIcon, getTabBadge } = props
+  const { state, tree, newTabOptions, actions, onNewTab, renderTab, getTabIcon, getTabBadge, isDirty } = props
   return (
     <div className={css.workbench}>
       <NodeView
@@ -293,6 +310,7 @@ export function Workbench(props: {
         renderTab={renderTab}
         getTabIcon={getTabIcon}
         getTabBadge={getTabBadge}
+        isDirty={isDirty}
       />
     </div>
   )

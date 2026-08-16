@@ -37,6 +37,7 @@ function mountBar(overflow: boolean): { list: HTMLElement; unmount: () => void }
       onNewTab: () => {},
       newTabOptions: [],
       onDropTab: () => {},
+      isDirty: () => false,
     }))
   })
   const list = container.querySelector('[class*="tabList"]') as HTMLElement

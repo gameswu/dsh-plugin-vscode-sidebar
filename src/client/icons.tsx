@@ -108,3 +108,11 @@ export const IconGlobeOutline16 = ({ size = 16, className }: IconProps) => (
     <path d="M1.5 8h13M8 1.5c-2.4 1.8-2.4 11.2 0 13M8 1.5c2.4 1.8 2.4 11.2 0 13" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
   </svg>
 )
+
+/** Video viewer glyph: a film frame with a play triangle. */
+export const IconVideoOutline16 = ({ size = 16, className }: IconProps) => (
+  <svg width={size} height={size} className={className} viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <rect x="1.5" y="2.5" width="13" height="11" rx="2" stroke="currentColor" strokeWidth="1.5" />
+    <path d="m6.75 5.5 3.75 2.5-3.75 2.5z" stroke="currentColor" strokeWidth="1.25" strokeLinejoin="round" />
+  </svg>
+)

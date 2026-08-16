@@ -5,13 +5,12 @@
  * terminal). Tabs are draggable; dropping onto another tab inserts before it,
  * dropping on the strip background appends to this pane.
  */
-import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import clsx from 'clsx'
 import {
   IconCloseFill14, IconPlusOutline16, Menu,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { SidebarTab } from './state.ts'
-import { getTabDirtyRevision, isTabDirty, subscribeTabDirty } from './dirty-tabs.ts'
 import { t } from './locales.ts'
 import css from './sidebar.module.css'
 
@@ -67,17 +66,19 @@ export function TabBar(props: {
   /** Badge resolver for tab labels (reads the descriptor's `badge`; the
    *  resolver returns the rendered pill or null). */
   getTabBadge?: (tab: SidebarTab) => ReactNode
+  /**
+   * The unsaved-flag resolver (the shell delegates to the STORE's dirty
+   * registry — the store is the single source of truth shared with the
+   * lazily-loaded editor chunk, so this never desyncs).
+   */
+  isDirty: (tabId: string) => boolean
 }) {
   const {
-    paneId, tabs, active, onActivate, onClose, onNewTab, newTabOptions, onDropTab, getTabIcon, getTabBadge,
+    paneId, tabs, active, onActivate, onClose, onNewTab, newTabOptions, onDropTab, getTabIcon, getTabBadge, isDirty,
   } = props
   const [menuOpen, setMenuOpen] = useState(false)
   const [dragOver, setDragOver] = useState(false)
   const listRef = useRef<HTMLDivElement>(null)
-  // The VSCode-style unsaved dot on editor tab titles follows the dirty
-  // registry (the editor view flips it on content change / save).
-  const dirtyRevision = useSyncExternalStore(subscribeTabDirty, getTabDirtyRevision)
-  void dirtyRevision
 
   // Wheel over the strip scrolls the tab row horizontally (a plain mouse
   // wheel emits deltaY, which overflow-x alone never consumes). Bound as a
@@ -167,7 +168,7 @@ export function TabBar(props: {
             {getTabIcon?.(tab) ?? null}
             {getTabBadge?.(tab) ?? null}
             <span className={css.tabTitle}>{tab.title}</span>
-            {isTabDirty(tab.id) && <span className={css.tabDirtyDot} aria-hidden="true" title={t('unsaved')} />}
+            {isDirty(tab.id) && <span className={css.tabDirtyDot} aria-hidden="true" title={t('unsaved')} />}
             <button
               type="button"
               className={css.tabClose}

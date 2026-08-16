@@ -53,15 +53,13 @@ import {
 import { api, type JobOutputResult } from './api.ts'
 import { IconStopOutline16 } from './icons.tsx'
 import { t } from './locales.ts'
+import { subscribeAgentTerminalFeed } from './agent-terminals-feed.ts'
+import { subscribeHeartbeat } from './heartbeat.ts'
 import type { SidebarPrefs } from '../prefs-shared.ts'
 import css from './SubagentView.module.css'
 
-/** Refresh cadence of the live "last text + tool call" lines while a child runs. */
-const POLL_MS = 3000
 /** Preview cap of one tool-call argument line. */
 const ARGS_PREVIEW = 60
-/** Refresh cadence of an expanded job-output panel while its job runs. */
-const JOB_POLL_MS = 2000
 /** How long the kill button stays armed before it needs re-confirming. */
 const JOB_KILL_ARM_MS = 3000
 
@@ -188,8 +186,15 @@ function SubagentLiveLines(props: {
     if (!active) return
     void load()
     if (!running) return
-    const timer = window.setInterval(() => { void load() }, POLL_MS)
-    return () => { window.clearInterval(timer) }
+    // The shared 1s heartbeat, divided into the 3s activity cadence.
+    let ticks = 0
+    return subscribeHeartbeat(() => {
+      ticks += 1
+      if (ticks >= 3) {
+        ticks = 0
+        void load()
+      }
+    })
   }, [load, running, active])
 
   useEffect(() => () => { controllerRef.current?.abort() }, [])
@@ -389,7 +394,14 @@ function JobTerminal(props: {
     controllerRef.current = controller
     try {
       const result = await api.jobOutput({ sessionId: ownerSessionId }, job.id, controller.signal)
-      setState(result)
+      // The poll runs every 2s while the job is live; identical output is
+      // the common case — keep the previous state object so the panel does
+      // not re-render (and the terminal does not re-paint) for nothing.
+      setState(current =>
+        current === 'loading' || typeof current === 'string'
+        || current.text !== result.text || current.read !== result.read || current.truncated !== result.truncated
+          ? result
+          : current)
     } catch {
       // A newer pull aborted this one, or the wire failed: keep the last
       // known output; only a terminal that never loaded anything shows an error.
@@ -400,8 +412,15 @@ function JobTerminal(props: {
   useEffect(() => {
     void load()
     if (!active || !live) return
-    const timer = window.setInterval(() => { void load() }, JOB_POLL_MS)
-    return () => { window.clearInterval(timer) }
+    // The shared 1s heartbeat, divided into the panel's 2s poll cadence.
+    let ticks = 0
+    return subscribeHeartbeat(() => {
+      ticks += 1
+      if (ticks >= 2) {
+        ticks = 0
+        void load()
+      }
+    })
   }, [load, active, job.status])
 
   useEffect(() => () => { controllerRef.current?.abort() }, [])
@@ -547,8 +566,8 @@ function JobsSection(props: {
   useEffect(() => {
     if (liveCount === 0) return
     setNow(Date.now())
-    const timer = window.setInterval(() => { setNow(Date.now()) }, 1_000)
-    return () => { window.clearInterval(timer) }
+    // The shared 1s heartbeat (one timer for the whole page).
+    return subscribeHeartbeat(() => { setNow(Date.now()) })
   }, [liveCount])
 
   // The docked output pane follows its job: when the selected job leaves
@@ -673,8 +692,9 @@ type AgentTerminalEntry =
   | { kind: 'plugin'; uuid: string; title: string; command: string; exited: boolean }
   | { kind: 'harness'; id: string; title: string; type: string; exited: boolean }
 
-/** How many consecutive list-socket failures stop the reconnect loop. */
-const AGENT_LIST_FAILURE_LIMIT = 3
+/** Client-side scrollback cap of one stream view (long transcripts must not
+ *  make the append re-render O(n²); older lines fall off the view). */
+const STREAM_TEXT_CAP = 128 * 1024
 
 /**
  * The read-only STREAM of one agent terminal: attaches to the terminal
@@ -698,6 +718,13 @@ function AgentTerminalStream(props: {
   const [live, setLive] = useState(!exited)
   const [pinned, setPinned] = useState(true)
   const preRef = useRef<HTMLPreElement>(null)
+  // The section re-renders on EVERY list push (the feed re-sends on a slow
+  // cadence) and rebuilds `source` as a fresh object each render. Depending
+  // on the object identity would tear down and reconnect the socket —
+  // clearing and replaying the transcript — which is exactly the visible
+  // FLICKER. The effect keys on a stable primitive identity instead; the
+  // URL is rebuilt from the current props whenever the effect (re)runs.
+  const streamKey = source.kind === 'harness' ? `harness:${source.id}` : `plugin:${source.uuid}`
 
   useEffect(() => {
     setText('')
@@ -713,7 +740,11 @@ function AgentTerminalStream(props: {
     const socket = new WebSocket(url.toString())
     socket.onmessage = (event) => {
       if (typeof event.data !== 'string') return
-      setText(current => current + event.data)
+      setText((current) => {
+        const next = current + event.data
+        // Bounded scrollback: keep the append cheap and the re-render linear.
+        return next.length > STREAM_TEXT_CAP ? next.slice(next.length - STREAM_TEXT_CAP) : next
+      })
       if ((event.data as string).includes('[process exited')) setLive(false)
     }
     socket.onclose = () => { setLive(false) }
@@ -721,7 +752,7 @@ function AgentTerminalStream(props: {
       // Bare drop: the pty stays alive (the agent owns its lifetime).
       socket.close()
     }
-  }, [source, exited])
+  }, [streamKey, exited])
 
   // Terminal-tail behavior: while live and pinned, follow the newest output.
   useEffect(() => {
@@ -801,6 +832,10 @@ function AgentTerminalsSection(props: {
   const [entries, setEntries] = useState<AgentTerminalEntry[]>([])
   const [expandedKey, setExpandedKey] = useState<string | null>(null)
   const enabled = ctx.vscodeSidebar?.isTabEnabled('terminal') !== false
+  // The host re-sends the list on a slow cadence; identical frames are the
+  // common case. Skipping them avoids re-parsing AND a full section re-render
+  // every cadence tick (perf: the stream views stay mounted untouched).
+  const lastFrameRef = useRef<string>('')
 
   /** Stable row key of one entry (plugin uuid / harness session id). */
   const keyOf = (entry: AgentTerminalEntry): string => (entry.kind === 'harness' ? entry.id : entry.uuid)
@@ -829,67 +864,46 @@ function AgentTerminalsSection(props: {
       setExpandedKey(null)
       return
     }
-    let socket: WebSocket | null = null
-    let retry: number | undefined
-    let closed = false
-    let failures = 0
-    const connect = (): void => {
-      if (closed) return
-      const url = new URL('/sidebar/ws/agent-terminals', location.origin)
-      url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
-      url.search = new URLSearchParams({ sessionId }).toString()
-      socket = new WebSocket(url.toString())
-      socket.onmessage = (event) => {
-        if (typeof event.data !== 'string') return
-        try {
-          const raw = JSON.parse(event.data) as unknown
-          if (!Array.isArray(raw)) return
-          // Defensive wire parse: harness entries carry kind+id; everything
-          // else is a plugin terminal (frames predating the harness feed
-          // lack `kind` entirely and still carry a uuid).
-          const list = raw.map((item): AgentTerminalEntry | null => {
-            if (item === null || typeof item !== 'object') return null
-            const record = item as Record<string, unknown>
-            if (record.kind === 'harness' && typeof record.id === 'string') {
-              return {
-                kind: 'harness',
-                id: record.id,
-                title: typeof record.title === 'string' ? record.title : 'terminal',
-                type: typeof record.type === 'string' ? record.type : '',
-                exited: record.exited === true,
-              }
+    // The SHARED agent-terminal feed (one socket per session shared with the
+    // sidebar's tab mirror): subscribe to raw frames, parse defensively.
+    return subscribeAgentTerminalFeed(sessionId, (frame) => {
+      if (frame === lastFrameRef.current) return
+      lastFrameRef.current = frame
+      try {
+        const raw = JSON.parse(frame) as unknown
+        if (!Array.isArray(raw)) return
+        // Defensive wire parse: harness entries carry kind+id; everything
+        // else is a plugin terminal (frames predating the harness feed
+        // lack `kind` entirely and still carry a uuid).
+        const list = raw.map((item): AgentTerminalEntry | null => {
+          if (item === null || typeof item !== 'object') return null
+          const record = item as Record<string, unknown>
+          if (record.kind === 'harness' && typeof record.id === 'string') {
+            return {
+              kind: 'harness',
+              id: record.id,
+              title: typeof record.title === 'string' ? record.title : 'terminal',
+              type: typeof record.type === 'string' ? record.type : '',
+              exited: record.exited === true,
             }
-            if (typeof record.uuid === 'string') {
-              return {
-                kind: 'plugin',
-                uuid: record.uuid,
-                title: typeof record.title === 'string' ? record.title : 'terminal',
-                command: typeof record.command === 'string' ? record.command : '',
-                exited: record.exited === true,
-              }
+          }
+          if (typeof record.uuid === 'string') {
+            return {
+              kind: 'plugin',
+              uuid: record.uuid,
+              title: typeof record.title === 'string' ? record.title : 'terminal',
+              command: typeof record.command === 'string' ? record.command : '',
+              exited: record.exited === true,
             }
-            return null
-          }).filter((entry): entry is AgentTerminalEntry => entry !== null)
-          setEntries(list)
-          setExpandedKey(current => (current !== null && list.some(entry => keyOf(entry) === current) ? current : null))
-        } catch {
-          // Malformed push: ignore (the next push will reconcile).
-        }
+          }
+          return null
+        }).filter((entry): entry is AgentTerminalEntry => entry !== null)
+        setEntries(list)
+        setExpandedKey(current => (current !== null && list.some(entry => keyOf(entry) === current) ? current : null))
+      } catch {
+        // Malformed push: ignore (the next push will reconcile).
       }
-      socket.onclose = () => {
-        if (closed) return
-        failures += 1
-        if (failures >= AGENT_LIST_FAILURE_LIMIT) return
-        retry = window.setTimeout(connect, 2000)
-      }
-      socket.onerror = () => { socket?.close() }
-    }
-    connect()
-    return () => {
-      closed = true
-      window.clearTimeout(retry)
-      socket?.close()
-    }
+    }, true)
   }, [sessionId, active, enabled])
 
   if (entries.length === 0) return null

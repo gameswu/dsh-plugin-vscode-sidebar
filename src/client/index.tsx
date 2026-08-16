@@ -13,7 +13,7 @@ import { createRoot, type Root } from 'react-dom/client'
 import type { Context, SidebarSettingsScopeBinder } from '../context-types.ts'
 import { createSidebarStore, defaultWidthFor, setWidth } from './state.ts'
 import { createVscodeSidebarService } from './service.ts'
-import { resetChunks } from './chunk-loader.ts'
+import { resetChunks, prefetchBundleAsset } from './chunk-loader.ts'
 import { registerBuiltins } from './builtins/index.ts'
 import { Sidebar } from './Sidebar.tsx'
 import { RenderBoundary } from './RenderBoundary.tsx'
@@ -96,6 +96,9 @@ export function apply(ctx: Context): void {
     // registered by a previous fiber (HMR) and drop the in-memory load cache
     // so the next lazy open re-fetches the current chunk scripts.
     resetChunks()
+    // Predictive warm-up: the terminal chunk is the other heavy lazy bundle
+    // — prefetch it on idle so the first terminal tab opens instantly.
+    prefetchBundleAsset('terminal')
     ctx.effect(() => {
       let disposed = false
       let root: Root | undefined

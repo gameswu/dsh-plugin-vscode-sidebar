@@ -9,9 +9,17 @@
  * divides the space row- or column-wise with fractional sizes. All tree
  * operations are pure functions over the node, unit-tested in tests/state.spec.ts.
  */
+import { useCallback, useRef, useSyncExternalStore } from 'react'
 import { SIDEBAR_PREFS_DEFAULTS, type SidebarPrefs } from '../prefs-shared.ts'
 import { isNarrowWidth } from './breakpoints.ts'
+import {
+  dirtyRevision as bridgeRevision, isDirty as bridgeIsDirty, registerSave as bridgeRegisterSave,
+  saveTab as bridgeSaveTab, setDirty as bridgeSetDirty, subscribeDirty as bridgeSubscribe,
+  type SaveTabFn,
+} from './dirty-bridge.ts'
 import { t } from './locales.ts'
+
+export type { SaveTabFn }
 
 /**
  * Tab type identifier. Builtins register their ids (explorer / git / editor
@@ -744,6 +752,56 @@ export interface SidebarSnapshot {
    * them — the + menu hides a tab type the moment its switch flips.
    */
   prefs: SidebarPrefs
+  /**
+   * Monotonic revision of the unsaved-tab set (bumped by setTabDirty), so
+   * the shell — and the tab strip it renders — re-renders the dirty dot
+   * the moment an editor flips it. The dirty state lives HERE, in the
+   * store, so the lazily-loaded editor chunk (which receives this store
+   * through props) and the shell share ONE source of truth instead of two
+   * module instances that never saw each other.
+   */
+  dirtyRevision: number
+}
+
+/** Shallow equality over prefs (per-key reference compare — object-valued
+ *  keys like tabsEnabled keep their identity until actually changed). */
+function prefsEqual(left: SidebarPrefs, right: SidebarPrefs): boolean {
+  if (left === right) return true
+  const keysLeft = Object.keys(left)
+  const keysRight = Object.keys(right)
+  if (keysLeft.length !== keysRight.length) return false
+  for (const key of keysLeft) {
+    if ((left as unknown as Record<string, unknown>)[key] !== (right as unknown as Record<string, unknown>)[key]) {
+      return false
+    }
+  }
+  return true
+}
+
+/**
+ * Selector-scoped store subscription: heavy views subscribe to ONE slice of
+ * the snapshot instead of re-rendering on every unrelated notify (the
+ * snapshot is one object, so any change re-renders wholesale consumers).
+ * @param store - the sidebar store.
+ * @param selector - picks the slice (must return a STABLE value while the
+ *   slice is unchanged — memoize object results, or use the isEqual guard).
+ * @param isEqual - change predicate (defaults to Object.is).
+ */
+export function useStoreSelector<T>(
+  store: SidebarStore,
+  selector: (snapshot: SidebarSnapshot) => T,
+  isEqual: (left: T, right: T) => boolean = Object.is,
+): T {
+  const subscribe = useCallback((listener: () => void) => store.subscribe(listener), [store])
+  const getSnapshot = useCallback(() => selector(store.getSnapshot()), [store, selector])
+  const value = useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
+  // Honor the custom predicate: keep returning the previous reference while
+  // the selected slice is "equal", so consumers skip the re-render even when
+  // the selector builds a fresh object per snapshot.
+  const ref = useRef<T | undefined>(undefined)
+  if (ref.current !== undefined && isEqual(ref.current, value)) return ref.current
+  ref.current = value
+  return value
 }
 
 /** Default panel width for one viewport: the prefs percent of the window,
@@ -942,6 +1000,7 @@ export class SidebarStore {
     sessionId: undefined,
     state: undefined,
     prefs: { ...SIDEBAR_PREFS_DEFAULTS },
+    dirtyRevision: 0,
   }
   private readonly listeners = new Set<() => void>()
   /** Per-session persist debounce timers (v0.12.0+: one per session, so a
@@ -949,14 +1008,34 @@ export class SidebarStore {
   private readonly persistTimers = new Map<string, number>()
   /** User-facing side card prefs seeding brand-new session states (defaults until the settings RPC resolves). */
   private prefs: SidebarPrefs = { ...SIDEBAR_PREFS_DEFAULTS }
+  // ── Unsaved-tab registry (the dirty dot / save-on-close / Ctrl+S) ────────
+  // DELEGATES to the window-scoped dirty bridge (see dirty-bridge.ts): the
+  // bridge is the single source of truth shared by EVERY bundle copy — the
+  // lazily-loaded editor chunk writes through it directly, and this store
+  // mirrors its revision into the snapshot so the shell re-renders on every
+  // flip. Mixed bundle versions cannot desync it: there is only one window.
+  private dirtyRevision = 0
+  private readonly bridgeOff: () => void
+
+  constructor() {
+    // Mirror bridge changes into the snapshot (the React re-render trigger).
+    this.bridgeOff = bridgeSubscribe(() => {
+      this.dirtyRevision = bridgeRevision()
+      this.snapshot = { ...this.snapshot, dirtyRevision: this.dirtyRevision }
+      this.notify()
+    })
+  }
 
   /**
    * Replace the side card prefs (the settings RPC result / settings page
    * write). Notifies like any store change: the snapshot carries the prefs,
    * so consumers that gate on enable switches (the + menu, derived flows)
-   * re-render with the new values immediately.
+   * re-render with the new values immediately. Equal values never notify —
+   * the settings scope re-pushes on every connection event, and a no-op
+   * bump would re-render the whole tree for nothing.
    */
   setPrefs(prefs: SidebarPrefs): void {
+    if (prefsEqual(this.prefs, prefs)) return
     this.prefs = { ...prefs }
     this.snapshot = { ...this.snapshot, prefs: this.prefs }
     this.notify()
@@ -967,11 +1046,38 @@ export class SidebarStore {
     return { ...this.prefs }
   }
 
+  // ── Unsaved-tab registry (the tab dirty dot, save-on-close, Ctrl+S) ──────
+
+  /** Register one editor tab's save callback; the dirty flag clears on disposal. */
+  registerTabSave(tabId: string, save: SaveTabFn): () => void {
+    return bridgeRegisterSave(tabId, save)
+  }
+
+  /** Flip one editor tab's dirty flag (the tab strip's dot follows it). */
+  setTabDirty(tabId: string, value: boolean): void {
+    bridgeSetDirty(tabId, value)
+  }
+
+  /** Whether one editor tab has unsaved changes. */
+  isTabDirty(tabId: string): boolean {
+    return bridgeIsDirty(tabId)
+  }
+
+  /** Save one tab through its registered callback; resolves to success. */
+  async saveTab(tabId: string): Promise<boolean> {
+    return bridgeSaveTab(tabId)
+  }
+
+  /** Release the bridge subscription (disposal; tests call this too). */
+  dispose(): void {
+    this.bridgeOff()
+  }
+
   /** Select a session (or none); loads its persisted state. */
   setSession(sessionId: string | undefined): void {
     if (this.snapshot.sessionId === sessionId) return
     if (sessionId === undefined) {
-      this.snapshot = { sessionId: undefined, state: undefined, prefs: this.prefs }
+      this.snapshot = { sessionId: undefined, state: undefined, prefs: this.prefs, dirtyRevision: this.dirtyRevision }
     } else {
       let state = this.bySession.get(sessionId)
       if (state === undefined) {
@@ -983,7 +1089,7 @@ export class SidebarStore {
         // pane/split ids can never collide with its tree.
         nextIdCounter = maxCounterId(state)
       }
-      this.snapshot = { sessionId, state, prefs: this.prefs }
+      this.snapshot = { sessionId, state, prefs: this.prefs, dirtyRevision: this.dirtyRevision }
     }
     this.notify()
   }
@@ -1005,7 +1111,7 @@ export class SidebarStore {
     const draft = structuredClone(state)
     mutator(draft)
     this.bySession.set(sessionId, draft)
-    this.snapshot = { sessionId, state: draft, prefs: this.prefs }
+    this.snapshot = { sessionId, state: draft, prefs: this.prefs, dirtyRevision: this.dirtyRevision }
     this.schedulePersist(sessionId, draft)
     this.notify()
   }
@@ -1037,7 +1143,7 @@ export class SidebarStore {
     // localStorage.
     if (next === state) return
     this.bySession.set(sessionId, next)
-    this.snapshot = { sessionId, state: next, prefs: this.prefs }
+    this.snapshot = { sessionId, state: next, prefs: this.prefs, dirtyRevision: this.dirtyRevision }
     this.schedulePersist(sessionId, next)
     this.notify()
   }

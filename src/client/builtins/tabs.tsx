@@ -59,20 +59,6 @@ function uiTerminalCount(state: SidebarState): number {
     .filter(tab => tab.type === 'terminal' && !isAgentTabId(tab.id)).length
 }
 
-/** The repo selection persisted in the git tab's meta (survives the pane
- *  restructuring a diff-tab open causes — the view remounts). */
-function savedRepoOf(tab: { meta?: unknown }): string | null {
-  const meta = tab.meta
-  if (meta === null || typeof meta !== 'object') return null
-  const repo = (meta as { repo?: unknown }).repo
-  return typeof repo === 'string' && repo !== '' ? repo : null
-}
-
-/** Persist the git panel's repo selection into the tab meta (layout storage). */
-function persistRepo(ctx: Context, tabId: string, repo: string | null): void {
-  ctx.vscodeSidebar?.updateTab(tabId, { meta: { repo } })
-}
-
 /** The 7 built-in tab descriptors. */
 export function builtinTabs(ctx: Context): readonly TabDescriptor[] {
   return [
@@ -120,9 +106,9 @@ export function builtinTabs(ctx: Context): readonly TabDescriptor[] {
       icon: (size: number) => <IconBranchOutline16 size={size} />,
       order: 20,
       single: true,
-      // Declarative settings: the nested-repo discovery exclusions render
-      // under this card's gear (plugin-owned key, persisted by the host's
-      // settings seam under pluginSettings.git).
+      // Declarative settings: the nested-repo discovery exclusions + scan
+      // depth render under this card's gear (plugin-owned keys, persisted by
+      // the host's settings seam under pluginSettings.git).
       settings: {
         pluginToggles: [{
           key: 'gitRepoExcludePatterns',
@@ -130,13 +116,18 @@ export function builtinTabs(ctx: Context): readonly TabDescriptor[] {
           title: () => t('settingsGitExcludeTitle'),
           desc: () => t('settingsGitExcludeDesc'),
           placeholder: t('settingsGitExcludePlaceholder'),
+        }, {
+          key: 'gitRepoScanDepth',
+          type: 'number',
+          min: 1,
+          max: 10,
+          title: () => t('settingsGitScanDepthTitle'),
+          desc: () => t('settingsGitScanDepthDesc'),
         }],
       },
-      component: ({ ctx, store, scope, tab, onOpenDiff }) => (
+      component: ({ ctx, store, scope, onOpenDiff }) => (
         <GitView
           scope={scope}
-          savedRepo={savedRepoOf(tab)}
-          onRepoChange={(repo) => { persistRepo(ctx, tab.id, repo) }}
           onOpenFile={(path) => { openSidebarFile(ctx, store, scope.sessionId, path) }}
           onOpenDiff={onOpenDiff ?? (() => { /* no-op */ })}
         />

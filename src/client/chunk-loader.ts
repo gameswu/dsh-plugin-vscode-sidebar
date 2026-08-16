@@ -74,6 +74,24 @@ export const CHUNK_EXTERNALS: readonly string[] = [
 /** Chunk script endpoint served by the plugin host half (src/bundle-route.ts). */
 const CHUNK_URL = (name: ChunkName): string => `/sidebar/bundle/${name}.js`
 
+/**
+ * Best-effort predictive prefetch of one /sidebar/bundle asset (the heavy
+ * chunks + the editor worker): a `<link rel="prefetch">` lets the browser
+ * warm the asset on idle so the first open does not pay the download. Safe
+ * no-op on failure/older browsers.
+ */
+export function prefetchBundleAsset(name: string): void {
+  try {
+    const link = document.createElement('link')
+    link.rel = 'prefetch'
+    link.as = 'script'
+    link.href = `/sidebar/bundle/${name}.js`
+    document.head.appendChild(link)
+  } catch {
+    // Prefetch is best-effort; the lazy load path still works without it.
+  }
+}
+
 /** The monaco editor worker script (a standalone IIFE served by the same
  *  route; loaded by the editor chunk via `new Worker(...)`). */
 export const EDITOR_WORKER_URL = '/sidebar/bundle/editor-worker.js'
