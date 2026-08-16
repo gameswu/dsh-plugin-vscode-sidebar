@@ -680,6 +680,22 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
     appendToDraft(ctx, sessionId, `@${relativeTo(cwd ?? '', path)}`)
   }, [ctx, sessionId, cwd])
 
+  // The + menu options, memoized on the DATA they derive from: the state
+  // tree and the prefs. A prefs/dirty notify that changes neither keeps the
+  // same array reference, so the memoized leaf subtrees skip re-rendering.
+  // Like every other hook this memo lives ABOVE the no-session early return
+  // — a hook must never sit behind a conditional return (React counts hooks
+  // per render): the first mount render (before setSession hydrates `state`)
+  // takes the early return, and the post-hydration render calling this memo
+  // crashed with "Rendered more hooks" (#310). While there is no state yet
+  // it yields an empty option list (the no-session cluster shows no + menu).
+  const newTabOptions = useMemo(
+    () => (state === undefined || sessionId === undefined
+      ? []
+      : buildNewTabOptions(state, ctx, { sessionId, cwd })),
+    [state, ctx, sessionId, cwd, snapshot.prefs],
+  )
+
   if (state === undefined || sessionId === undefined) {
     return (
       <div className={css.toggleCluster}>
@@ -709,20 +725,6 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
     service.openTab({ type: optionId, title }, { sessionId, cwd })
   }
 
-  // The + menu options, memoized on the DATA they derive from: the state
-  // tree and the prefs. A prefs/dirty notify that changes neither keeps the
-  // same array reference, so the memoized leaf subtrees skip re-rendering.
-  const newTabOptions = useMemo(
-    () => buildNewTabOptions(state, ctx, { sessionId, cwd }),
-    [state, ctx, sessionId, cwd, snapshot.prefs],
-  )
-
-  /**
-   * The explorer's @-reference button: append `@<relative path>` to the
-   * session's composer draft (space-separated). Resolves the session-scope
-   * ctx and the conversation input service at click time; a missing service
-   * or scope degrades to a logged no-op, never a crash.
-   */
   /** The tab icon: per-FILE vscode-icons for editor tabs and worktree-diff
    *  tabs (they carry a concrete path), else the tab-type glyph from the
    *  descriptor registry. */
